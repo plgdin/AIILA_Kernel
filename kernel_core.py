@@ -5,10 +5,13 @@ import threading
 import textwrap
 import speech_recognition as sr
 from PIL import Image
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
 # --- 1. SETUP GOOGLE GEMINI API ---
 from google import genai
-client = genai.Client(api_key="AIzaSyDm-ByVGssk_Rhw0lZ76J_PryJvkeIveP4")
+client = genai.Client(api_key="AIzaSyB1f6Pe348ThuMGf4fOccBOUMdHPD4yQ1Y")
 
 # --- 2. LOAD LOCAL DATABASE IMAGES ---
 print("Loading Database Images...")
@@ -41,6 +44,17 @@ for index, name in enumerate(sr.Microphone.list_microphone_names()):
                 break
     except Exception:
         pass
+
+# --- 4. INITIALIZE MEDIAPIPE (HAND TRACKING) ---
+print("\n--- Initializing Gesture Engine ---")
+model_path = 'hand_landmarker.task'
+base_options = python.BaseOptions(model_asset_path=model_path)
+options = vision.HandLandmarkerOptions(base_options=base_options, num_hands=1)
+detector = vision.HandLandmarker.create_from_options(options)
+
+# Gesture tracking variables
+prev_finger_x = 0.0          
+swipe_cooldown = 0           
 
 # --- AR TEXT ENGINE (Word Wrapping for OpenCV) ---
 def draw_ar_paragraph(img, text, position, font, font_scale, color, thickness, max_width_pixels):
@@ -95,7 +109,7 @@ def listen_and_process_command():
                 )
                 answer = response.text.strip()
                 
-                # Check if Gemini wants to change the layers
+                # Check if Gemini wants to change the layers via Voice
                 if "[LAYER2]" in answer:
                     current_layer_view = 2
                     answer = answer.replace("[LAYER2]", "").strip()
@@ -103,7 +117,7 @@ def listen_and_process_command():
                     current_layer_view = 1
                     answer = answer.replace("[LAYER1]", "").strip()
                 
-                # Update the AR Text that gets projected to the table!
+                # Update the AR Text that gets projected to the table
                 dynamic_ar_text = answer
                 voice_feedback = "Response generated."
                 print(f"JARVIS answered: {dynamic_ar_text}")
@@ -126,7 +140,7 @@ def scan_object(frame):
     pil_img = Image.fromarray(rgb_frame)
     
     try:
-        # The "Pipe Split" Prompt ensures we get both the broad category and exact model!
+        # The "Pipe Split" Prompt for exact model ID
         prompt = """
         Identify the object in the image. I need the broad category AND the exact specific model name.
         Reply strictly in this format: category | exact model name
@@ -143,7 +157,6 @@ def scan_object(frame):
         )
         ans = response.text.strip().replace("```", "").replace("\n", "")
         
-        # Split the AI's answer into two variables
         if "|" in ans:
             category, model = ans.split("|", 1)
             print(f"AI Identified Category: {category.strip()}")
@@ -157,11 +170,11 @@ def scan_object(frame):
         print(f"API Error: {e}")
         return "error", "error"
 
-# --- 4. CAMERA SETUP ---
+# --- 5. CAMERA SETUP ---
 print("\nHunting for camera...")
 cap = cv2.VideoCapture(1)
 
-# --- 5. WINDOW SETUP ---
+# --- 6. WINDOW SETUP ---
 window_name = "AIILA_Projector_OS"
 cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 cv2.resizeWindow(window_name, 1000, 700) 
@@ -179,8 +192,43 @@ while True:
     proj_h, proj_w = 700, 1000
     projector_canvas = np.zeros((proj_h, proj_w, 3), dtype=np.uint8)
 
+    # --- MEDIAPIPE SWIPE LOGIC ---
+    # Convert frame to format Mediapipe needs
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+    result = detector.detect(mp_image)
+
+    if result.hand_landmarks:
+        # Get the X coordinate of the Index Finger Tip (Landmark 8)
+        finger_x = result.hand_landmarks[0][8].x
+        
+        # Calculate how far the finger moved since the last frame
+        if prev_finger_x != 0.0 and swipe_cooldown == 0:
+            delta_x = finger_x - prev_finger_x
+            
+            # SWIPE TRIGGER: If finger jumps more than 15% of the screen horizontally
+            if abs(delta_x) > 0.15: 
+                # Toggle between Layer 1 and Layer 2 using HANDS
+                current_layer_view = 2 if current_layer_view == 1 else 1
+                print(f"SWIPE DETECTED! Switched to Layer {current_layer_view}")
+                
+                # Cooldown so it doesn't trigger repeatedly in one wave
+                swipe_cooldown = 20 
+                
+        prev_finger_x = finger_x
+        
+        # Draw a blue tracking dot on the Laptop Debug screen so you can see it working
+        cx, cy = int(finger_x * w), int(result.hand_landmarks[0][8].y * h)
+        cv2.circle(debug_canvas, (cx, cy), 15, (255, 0, 0), -1)
+    else:
+        # Reset the swipe tracker if hand leaves the frame
+        prev_finger_x = 0.0 
+
+    # Decrease cooldown timer
+    if swipe_cooldown > 0:
+        swipe_cooldown -= 1
+
     # --- AR PROJECTION DRAWING ---
-    # We now check active_category instead of active_object
     if active_category == "smartphone":
         
         # 1. Draw the Layers
@@ -201,7 +249,6 @@ while True:
             projector_canvas[y_offset_bat:y_offset_bat+300, x_offset_bat:x_offset_bat+200] = battery_img
             cv2.putText(projector_canvas, "Battery Details", (x_offset_bat, y_offset_bat - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             
-    # If the AI sees an unknown object (like a coffee mug), it won't draw blueprints, but it CAN still show text!
     elif active_category == "unknown":
         pass # It just skips drawing the blueprints
 
@@ -218,7 +265,7 @@ while True:
             max_width_pixels=400
         )
 
-    # 3. UI Voice Status (Only show if an object has been scanned)
+    # 3. UI Voice Status
     if active_category is not None:
         cv2.putText(projector_canvas, "Press 'v' to speak a command or question", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
         if voice_feedback != "":
