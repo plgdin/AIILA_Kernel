@@ -1,0 +1,13 @@
+opencv-python
+numpy
+mediapipe
+face_recognition
+sounddevice
+soundfile
+SpeechRecognition
+pyttsx3
+requests
+pydub
+simpleaudio
+openai
+elevenlabs
