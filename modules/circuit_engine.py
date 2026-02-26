@@ -29,3 +29,8 @@ class CircuitEngine:
             cv2.circle(canvas, (x, y), 15, color, 2) # Outer glow ring
             cv2.putText(canvas, comp['data']['label'], (x + 20, y + 5), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+    # --- NEW METHOD TO CLEAR MARKED COMPONENTS ---
+    def clear_components(self):
+        """Wipes all placed components from the storage list."""
+        self.placed_components = []

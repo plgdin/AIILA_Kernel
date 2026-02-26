@@ -3,7 +3,7 @@ from PIL import Image
 from google import genai
 
 # Setup Gemini API
-client = genai.Client(api_key="AIzaSyB1f6Pe348ThuMGf4fOccBOUMdHPD4yQ1Y")
+client = genai.Client(api_key="AIzaSyAyl3shw2p_Zgh9f8t8imR01Do7XgsKIqE")
 
 def scan_object(frame):
     print("Scanning with Gemini Vision Core...")

@@ -7,39 +7,17 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
 # --- IMPORT OUR CUSTOM MODULES ---
-from vision_engine import scan_object
-from voice_engine import listen_and_process_command
+from modules.vision_engine import scan_object
+from modules.voice_engine import (
+    listen_and_process_command, 
+    WORKING_MIC_INDEX, WORKING_MIC_NAME, 
+    SPEAKER_NAME, SPEAKER_INDEX,
+    get_hardware_info
+)
+from modules.ui_hub import UIHub
+from modules.circuit_engine import CircuitEngine
 
-# --- [NEW] UI & CIRCUIT CLASSES ---
-class UIHub:
-    def __init__(self):
-        self.accent_color = (255, 191, 0) # Cyber Blue/Orange
-        
-    def draw_hud_base(self, canvas):
-        # Semi-transparent Sidebar
-        cv2.rectangle(canvas, (0, 0), (220, 700), (25, 25, 25), -1)
-        cv2.line(canvas, (220, 0), (220, 700), (50, 50, 50), 1)
-        # Bottom Console Area
-        cv2.rectangle(canvas, (220, 600), (1000, 700), (15, 15, 15), -1)
-        cv2.line(canvas, (220, 600), (1000, 600), (50, 50, 50), 1)
-        cv2.putText(canvas, "AIILA HOLOMAT v2.0", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.accent_color, 2)
-
-class CircuitModule:
-    def __init__(self):
-        self.components = [] # List of {type, pos}
-        
-    def add_comp(self, c_type, pos):
-        self.components.append({'type': c_type, 'pos': pos})
-        
-    def render(self, canvas):
-        for comp in self.components:
-            x, y = comp['pos']
-            # Draw holographic glow for components
-            cv2.circle(canvas, (x, y), 12, (0, 255, 0), 2)
-            cv2.putText(canvas, comp['type'].upper(), (x+15, y+5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-
-# --- 1. LOAD LOCAL DATABASE IMAGES ---
-print("Loading Database Images...")
+# --- 1. LOAD ASSETS ---
 layer1_img = cv2.imread("database/nothing_1.png")
 layer2_img = cv2.imread("database/nothing_2.png")
 battery_img = cv2.imread("database/nothing_bat.png")
@@ -48,32 +26,38 @@ if layer1_img is not None: layer1_img = cv2.resize(layer1_img, (250, 500))
 if layer2_img is not None: layer2_img = cv2.resize(layer2_img, (250, 500))
 if battery_img is not None: battery_img = cv2.resize(battery_img, (200, 300))
 
-# --- 2. GLOBAL STATE DICTIONARY ---
+# --- 2. GLOBAL STATE ---
 app_state = {
     'active_category': None,
     'active_model': None,
     'current_layer_view': 1,
     'is_listening': False,
     'voice_feedback': "",
-    'dynamic_ar_text': "",
-    'selected_tool': 'resistor', # Default tool for circuit builder
-    'is_pinching': False
+    'dynamic_ar_text': "", # Area for JARVIS responses
+    'selected_tool': 'resistor', 
+    'is_pinching': False,
+    'settings_open': False,
+    'camera_index': 1,
+    'mic_index': WORKING_MIC_INDEX,
+    'mic_name': WORKING_MIC_NAME,
+    'speaker_index': SPEAKER_INDEX,
+    'speaker_name': SPEAKER_NAME
 }
 
-# --- 3. INITIALIZE MEDIAPIPE ---
+hub = UIHub()
+circuit_engine = CircuitEngine()
 model_path = 'hand_landmarker.task'
 base_options = python.BaseOptions(model_asset_path=model_path)
 options = vision.HandLandmarkerOptions(base_options=base_options, num_hands=1)
 detector = vision.HandLandmarker.create_from_options(options)
 
-# Initialize new modules
-hub = UIHub()
-circuit_engine = CircuitModule()
+# --- MOUSE CALLBACK ---
+def mouse_handler(event, x, y, flags, param):
+    if event == cv2.EVENT_LBUTTONDOWN:
+        # CLICK DETECTION: Area for the text button (x: 10 to 150, y: 5 to 45)
+        if 10 <= x <= 150 and 5 <= y <= 45:
+            app_state['settings_open'] = not app_state['settings_open']
 
-prev_finger_x = 0.0          
-swipe_cooldown = 0           
-
-# --- AR TEXT ENGINE ---
 def draw_ar_paragraph(img, text, position, font, font_scale, color, thickness, max_width_pixels):
     x, y0 = position
     char_width = 15 if font_scale == 0.6 else 20
@@ -84,22 +68,26 @@ def draw_ar_paragraph(img, text, position, font, font_scale, color, thickness, m
         cv2.putText(img, line, (x, y), font, font_scale, color, thickness)
 
 # --- 4. CAMERA SETUP ---
-cap = cv2.VideoCapture(1)
-window_name = "AIILA_Projector_OS"
+cap = cv2.VideoCapture(app_state['camera_index'])
+window_name = "AIILA_INTEGRATED_OS"
 cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-cv2.resizeWindow(window_name, 1000, 700) 
+cv2.resizeWindow(window_name, 1400, 700) 
+cv2.setMouseCallback(window_name, mouse_handler)
 
-# --- THE MAIN KERNEL LOOP ---
+prev_finger_x = 0.0
+swipe_cooldown = 0
+
 while True:
     ret, frame = cap.read()
     if not ret: break
 
-    debug_canvas = frame.copy()
-    h, w, _ = frame.shape
+    # 1. Create Base Frame
+    projector_canvas = hub.create_base_frame()
     
-    # Create the Hub Canvas
-    projector_canvas = np.zeros((700, 1000, 3), dtype=np.uint8)
-    hub.draw_hud_base(projector_canvas)
+    # 2. Prep Debug Small
+    debug_h = 300 
+    debug_w = int(300 * (frame.shape[1]/frame.shape[0]))
+    debug_small = cv2.resize(frame, (debug_w, debug_h))
 
     # --- MEDIAPIPE LOGIC ---
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -107,75 +95,105 @@ while True:
     result = detector.detect(mp_image)
 
     if result.hand_landmarks:
-        # 1. Existing Swipe Logic
-        finger_x = result.hand_landmarks[0][8].x
+        hand = result.hand_landmarks[0]
+        index_tip, thumb_tip = hand[8], hand[4]
+        
         if prev_finger_x != 0.0 and swipe_cooldown == 0:
-            delta_x = finger_x - prev_finger_x
-            if abs(delta_x) > 0.15: 
+            if abs(index_tip.x - prev_finger_x) > 0.15: 
                 app_state['current_layer_view'] = 2 if app_state['current_layer_view'] == 1 else 1
                 swipe_cooldown = 20 
-        prev_finger_x = finger_x
+        prev_finger_x = index_tip.x
         
-        # 2. [NEW] Circuit Placement Logic (Pinch Gesture)
-        index_tip = result.hand_landmarks[0][8]
-        thumb_tip = result.hand_landmarks[0][4]
-        dist = np.sqrt((index_tip.x - thumb_tip.x)**2 + (index_tip.y - thumb_tip.y)**2)
-        
-        # Map hand coords to projector canvas
+        cv2.circle(debug_small, (int(index_tip.x * debug_w), int(index_tip.y * debug_h)), 10, (255, 0, 0), -1)
         cursor_x, cursor_y = int(index_tip.x * 1000), int(index_tip.y * 700)
-        cv2.circle(projector_canvas, (cursor_x, cursor_y), 10, (255, 191, 0), 2) # Cursor
+        cv2.circle(projector_canvas, (cursor_x, cursor_y), 10, (255, 191, 0), 2)
 
-        if dist < 0.05: # Pinch detected
+        dist = np.sqrt((index_tip.x - thumb_tip.x)**2 + (index_tip.y - thumb_tip.y)**2)
+        if dist < 0.05:
             if not app_state['is_pinching']:
-                circuit_engine.add_comp(app_state['selected_tool'], (cursor_x, cursor_y))
+                circuit_engine.add_component(app_state['selected_tool'], cursor_x, cursor_y)
                 app_state['is_pinching'] = True
         else:
             app_state['is_pinching'] = False
 
     if swipe_cooldown > 0: swipe_cooldown -= 1
 
-    # --- RENDER CIRCUIT MODULE ---
-    circuit_engine.render(projector_canvas)
+    # 3. Draw AR blueprint components
+    circuit_engine.draw_components(projector_canvas)
 
-    # --- EXISTING AR PROJECTION DRAWING ---
-    if app_state['active_category'] == "smartphone":
-        x_offset, y_offset = 250, 100 # Adjusted for new Sidebar
-        if app_state['current_layer_view'] == 1 and layer1_img is not None:
-            projector_canvas[y_offset:y_offset+500, x_offset:x_offset+250] = layer1_img
-            cv2.putText(projector_canvas, f"{app_state['active_model']} - Layer 1", (x_offset, y_offset - 10), 2, 0.6, (255, 255, 255), 2)
-        elif app_state['current_layer_view'] == 2 and layer2_img is not None:
-            projector_canvas[y_offset:y_offset+500, x_offset:x_offset+250] = layer2_img
-            if battery_img is not None:
-                projector_canvas[200:500, 520:720] = battery_img
+    # --- PROJECTOR WRITING & IMAGE DISPLAY ---
+    if app_state['active_model']:
+        # DISPLAY DETECTED OBJECT NAME IN CENTER HEADER
+        cv2.putText(projector_canvas, f"UNIT: {app_state['active_model'].upper()}", (350, 80), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 191, 0), 2)
+        
+        # IMPORT DATABASE PHOTOS IF SMARTPHONE
+        if app_state['active_category'] == "smartphone":
+            x_off, y_off = 250, 120 
+            if app_state['current_layer_view'] == 1 and layer1_img is not None:
+                projector_canvas[y_off:y_off+500, x_off:x_off+250] = layer1_img
+            elif app_state['current_layer_view'] == 2 and layer2_img is not None:
+                projector_canvas[y_off:y_off+500, x_off:x_off+250] = layer2_img
+                if battery_img is not None: projector_canvas[200:500, 520:720] = battery_img
 
-    # --- UI COMPONENTS ---
-    # Sidebar Info
-    cv2.putText(projector_canvas, "TOOLBOX", (20, 100), 2, 0.5, (150, 150, 150), 1)
-    cv2.putText(projector_canvas, f"> {app_state['selected_tool'].upper()}", (20, 130), 2, 0.6, (0, 255, 0), 2)
-    cv2.putText(projector_canvas, "1: Resistor  2: LED", (20, 160), 2, 0.4, (100, 100, 100), 1)
+        # INTERACTIVE VOICE WRITING AREA
+        if app_state['dynamic_ar_text'] != "":
+            draw_ar_paragraph(projector_canvas, app_state['dynamic_ar_text'], (550, 150), 
+                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, 400)
+        else:
+            cv2.putText(projector_canvas, "Waiting for Jarvis Analysis...", (550, 150), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-    # Console Logs
-    log_text = app_state['voice_feedback'] if app_state['voice_feedback'] else "SYSTEM IDLE"
-    cv2.putText(projector_canvas, f"TERMINAL: {log_text}", (240, 640), 2, 0.5, (0, 255, 255), 1)
-    
-    if app_state['dynamic_ar_text'] != "":
-        draw_ar_paragraph(projector_canvas, app_state['dynamic_ar_text'], (550, 100), 2, 0.7, (0, 255, 0), 2, 400)
+    # --- SETTINGS BUTTON ---
+    cv2.rectangle(projector_canvas, (15, 10), (145, 40), (45, 45, 45), -1)
+    cv2.rectangle(projector_canvas, (15, 10), (145, 40), (0, 255, 0), 1)
+    cv2.putText(projector_canvas, "SETTINGS", (35, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-    cv2.imshow("Laptop Debug", debug_canvas)
-    cv2.imshow(window_name, projector_canvas)
+    # 4. HUD and Status
+    cv2.putText(projector_canvas, f"TOOL: {app_state['selected_tool'].upper()}", (20, 130), 2, 0.6, (0, 255, 0), 2)
+    hub.update_status(projector_canvas, app_state['voice_feedback'] or "SYSTEM IDLE")
 
-    # --- KEYBOARD CONTROLS ---
+    # --- SETTINGS OVERLAY ---
+    if app_state['settings_open']:
+        overlay = projector_canvas.copy()
+        cv2.rectangle(overlay, (150, 80), (850, 620), (35, 35, 35), -1)
+        cv2.addWeighted(overlay, 0.85, projector_canvas, 0.15, 0, projector_canvas)
+        cv2.putText(projector_canvas, "HARDWARE CONTROL CENTER", (250, 140), 2, 0.8, (255, 191, 0), 2)
+        cv2.putText(projector_canvas, f"MIC (M): {app_state['mic_name']} ({app_state['mic_index']})", (180, 240), 2, 0.5, (255, 255, 255), 1)
+        cv2.putText(projector_canvas, f"SPEAKER: {app_state['speaker_name']}", (180, 310), 2, 0.5, (255, 255, 255), 1)
+        cv2.putText(projector_canvas, f"CAMERA (C): Integrated ({app_state['camera_index']})", (180, 380), 2, 0.5, (255, 255, 255), 1)
+        cv2.putText(projector_canvas, "Controls: [C] Cam | [M] Mic | [ESC] Close", (220, 580), 2, 0.4, (0, 255, 0), 1)
+
+    # --- FINAL VIEW ---
+    right_sidebar = np.zeros((700, debug_w+20, 3), dtype=np.uint8)
+    right_sidebar[:] = (25, 25, 25) 
+    right_sidebar[200:500, 10:10+debug_w] = debug_small
+    cv2.imshow(window_name, np.hstack((projector_canvas, right_sidebar)))
+
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'): break
+    elif key == 27: app_state['settings_open'] = False
+    elif key == ord('r'): 
+        circuit_engine.clear_components()
+        app_state['voice_feedback'] = "Marks Cleared"
+    elif app_state['settings_open']:
+        if key == ord('c'):
+            app_state['camera_index'] = (app_state['camera_index'] + 1) % 3
+            cap.release()
+            cap = cv2.VideoCapture(app_state['camera_index'])
+        elif key == ord('m'):
+            mics, _ = get_hardware_info()
+            app_state['mic_index'] = (app_state['mic_index'] + 1) % len(mics)
+            app_state['mic_name'] = mics[app_state['mic_index']]
     elif key == ord('s'):
+        app_state['voice_feedback'] = "SCANNING..."
+        cv2.waitKey(1)
         app_state['active_category'], app_state['active_model'] = scan_object(frame)
+        app_state['voice_feedback'] = f"DETECTED: {app_state['active_model']}"
     elif key == ord('v'):
-        if not app_state['is_listening'] and app_state['active_category'] is not None:
+        if not app_state['is_listening'] and app_state['active_model']:
             app_state['is_listening'] = True
             threading.Thread(target=listen_and_process_command, args=(app_state,)).start()
-    # Tool Selection
-    elif key == ord('1'): app_state['selected_tool'] = 'resistor'
-    elif key == ord('2'): app_state['selected_tool'] = 'led'
 
 cap.release()
 cv2.destroyAllWindows()
