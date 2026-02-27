@@ -1,13 +1,19 @@
+# --- EXISTING DEPENDENCIES ---
 opencv-python
 numpy
 mediapipe
-face_recognition
+#face_recognition
 sounddevice
 soundfile
 SpeechRecognition
 pyttsx3
 requests
 pydub
-simpleaudio
+#simpleaudio
 openai
 elevenlabs
+
+# --- NEW UI DEPENDENCIES ---
+customtkinter      # Modern UI framework
+Pillow             # Advanced image processing for UI textures
+darkdetect         # Helps CustomTkinter sync with System Theme

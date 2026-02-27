@@ -1,9 +1,15 @@
+import os
 import cv2
 from PIL import Image
 from google import genai
+from dotenv import load_dotenv
 
-# Setup Gemini API
-client = genai.Client(api_key="AIzaSyAyl3shw2p_Zgh9f8t8imR01Do7XgsKIqE")
+# Load variables from .env
+load_dotenv()
+API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Setup Gemini API Client using the .env key
+client = genai.Client(api_key=API_KEY)
 
 def scan_object(frame):
     print("Scanning with Gemini Vision Core...")
@@ -24,12 +30,11 @@ def scan_object(frame):
         """
         
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.5-flash', # Updated to the standard 2.0 stable model
             contents=[prompt, pil_img]
         )
         ans = response.text.strip().replace("```", "").replace("\n", "")
         
-        # Split the AI's answer into two variables
         if "|" in ans:
             category, model = ans.split("|", 1)
             print(f"AI Identified Category: {category.strip()}")
@@ -41,4 +46,4 @@ def scan_object(frame):
             
     except Exception as e:
         print(f"API Error: {e}")
-        return "error", "error"
+        return "error", str(e)

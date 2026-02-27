@@ -1,9 +1,16 @@
+import os
 import speech_recognition as sr
 from google import genai
 import sounddevice as sd
+from dotenv import load_dotenv
+
+# Load variables from .env
+load_dotenv()
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+ELEVEN_KEY = os.getenv("ELEVENLABS_API_KEY")
 
 # Setup Gemini API
-client = genai.Client(api_key="AIzaSyAyl3shw2p_Zgh9f8t8imR01Do7XgsKIqE")
+client = genai.Client(api_key=GEMINI_KEY)
 
 def get_hardware_info():
     mics = sr.Microphone.list_microphone_names()
@@ -30,6 +37,7 @@ def get_speaker_info():
     except Exception:
         return "Default Speaker", 0
 
+# Initial Hardware Setup
 WORKING_MIC_INDEX, WORKING_MIC_NAME = initialize_mic()
 SPEAKER_NAME, SPEAKER_INDEX = get_speaker_info()
 
@@ -48,7 +56,7 @@ def listen_and_process_command(app_state):
             user_text = recognizer.recognize_google(audio)
             
             prompt = f"AR Assistant JARVIS. User at disassembled {app_state['active_model']}. Question: {user_text}"
-            response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+            response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
             answer = response.text.strip()
             
             if "[LAYER2]" in answer: app_state['current_layer_view'] = 2
@@ -56,6 +64,7 @@ def listen_and_process_command(app_state):
             
             app_state['dynamic_ar_text'] = answer.replace("[LAYER2]", "").replace("[LAYER1]", "").strip()
             app_state['voice_feedback'] = "Response generated."
-    except:
-        app_state['voice_feedback'] = "Error: Mic/Process Error"
+    except Exception as e:
+        app_state['voice_feedback'] = f"Error: {str(e)}"
+    
     app_state['is_listening'] = False
