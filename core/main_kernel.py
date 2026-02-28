@@ -44,7 +44,7 @@ from core.voice_engine   import (
     SPEAKER_NAME, SPEAKER_INDEX,
 )
 from core.circuit_engine import CircuitEngine
-from core.gesture_engine import GestureEngine, HAND_CONNECTIONS, GestureType
+from core.gesture_engine import GestureEngine, HAND_CONNECTIONS, GestureType, PinchState
 
 # AR canvas size — circuit engine must match this
 AR_W, AR_H = 1000, 700
@@ -337,6 +337,22 @@ class AIILAKernel:
                 sel = self.circuit_engine.selected_id
                 if sel is not None:
                     self.circuit_engine.rotate_component(sel, int(delta))
+
+        # ── CLAW ROTATE  (one-hand claw twist → rotate selected component) ──
+        elif g == GestureType.CLAW_ROTATE:
+            delta     = data.get('delta_deg', 0.0)
+            direction = data.get('direction', '')
+            self.app_state['ar_rotation'] = (self.app_state['ar_rotation'] + delta) % 360
+            self.app_state['voice_feedback'] = (
+                f"✊↻ CLAW {direction.upper()}  {delta:.1f}°"
+            )
+            if self.app_state['circuit_engine_enabled']:
+                sel = self.circuit_engine.selected_id
+                if sel is not None:
+                    # Map continuous degrees to 90° snapped steps
+                    steps = int(delta / 45.0)
+                    if steps != 0:
+                        self.circuit_engine.rotate_component(sel, steps * 90)
 
         # ── DWELL ──────────────────────────────────────────────────────────
         elif g == GestureType.DWELL:

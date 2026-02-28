@@ -523,112 +523,623 @@ class Viewport(QLabel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  PROJECTOR WINDOW  (redesigned)
+#  PROJECTOR WINDOW  — Full holographic OS desktop
 # ─────────────────────────────────────────────────────────────────────────────
 class ProjectorWindow(QWidget):
+    """
+    Full-screen secondary display rendered entirely in OpenCV onto a QLabel.
+
+    Layout (1920×1080):
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │  TOPBAR  — logo · clock · sys-stats                                  │
+    ├────────────────────────────┬─────────────────────────────────────────┤
+    │  AR FEED  (live camera)    │  RIGHT PANEL                            │
+    │  960×600                   │    ├─ SYSTEM METRICS  (4 gauges)        │
+    │                            │    ├─ KERNEL LOG  (scrolling)           │
+    │                            │    └─ APP DOCK  (icon grid)             │
+    ├────────────────────────────┴─────────────────────────────────────────┤
+    │  TASKBAR — uptime · gesture · active module · status dots            │
+    └──────────────────────────────────────────────────────────────────────┘
+    """
+
+    W, H = 1920, 1080
+
+    # App dock items: (label, icon_char, accent_bgr)
+    APPS = [
+        ("Circuit Lab",  "⎔", (255, 200,   0)),
+        ("Vision AI",   "◎", (  0, 200, 255)),
+        ("Voice CMD",   "◉", (  0, 255, 140)),
+        ("Settings",    "⚙", (180, 180, 180)),
+        ("Diagnostics", "▦", (255, 120,   0)),
+        ("Deploy",      "▶", (100, 255, 100)),
+        ("Analytics",   "▪", (200,   0, 255)),
+        ("Network",     "⊞", (  0, 160, 255)),
+    ]
+
     def __init__(self, x: int, y: int):
         super().__init__()
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.WindowStaysOnTopHint
         )
-        self.setGeometry(x, y, 1920, 1080)
+        self.setGeometry(x, y, self.W, self.H)
         self.setStyleSheet("background: black;")
 
-        self._display = QLabel(self)
-        self._display.setGeometry(0, 0, 1920, 1080)
-        self._display.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._canvas = QLabel(self)
+        self._canvas.setGeometry(0, 0, self.W, self.H)
 
-        self._t0         = time.time()
-        self._state      = "INTRO"
-        self._opacity    = 0.0
-        self._apps_vis   = False
-        self._anim_start = 0.0
-        self._btn        = (860, 650, 200, 50)
-        self._apps       = ["Circuit Lab", "Vision AI", "Voice CMD", "Settings", "Diagnostics", "Deploy"]
+        # State
+        self._t0          = time.time()
+        self._phase       = "BOOT"      # BOOT → INTRO → DESKTOP
+        self._fade        = 0.0
+        self._hovered_app = -1          # index of hovered dock item
+        self._active_app  = -1
+        self._log_lines   = [
+            "AIILA KERNEL v2.4 — BOOT SEQUENCE INITIATED",
+            "Handlandmark model loaded  [OK]",
+            "MediaPipe pipeline active  [OK]",
+            "CircuitEngine initialised  [OK]",
+            "Voice engine ready         [OK]",
+            "AR canvas 1000×700 mapped  [OK]",
+            "Projector output detected  [OK]",
+            "All subsystems nominal     [READY]",
+        ]
+        self._log_scroll  = 0
+        self._noise_seed  = 0
 
-    def update_display(self, ar_rgb: np.ndarray | None):
+        # Pre-compute dock rects for hit-testing
+        self._dock_rects: list[tuple[int,int,int,int]] = []
+
+        # Rolling metric history (fake but animated)
+        self._metric_hist = {k: [0.0]*80 for k in ("CPU","GPU","MEM","NET")}
+        self._metric_tick = 0
+
+        # Circuit engine reference (set each frame from UIHub)
+        self._circuit_engine = None
+        self._circuit_active = False
+
+    # ── rendering entry point ────────────────────────────────────────────────
+    def update_display(self, ar_rgb: np.ndarray | None,
+                       circuit_engine=None, circuit_active: bool = False):
         elapsed = time.time() - self._t0
-        frame   = np.zeros((1080, 1920, 3), dtype=np.uint8)
 
-        if self._state == "INTRO":
-            self._opacity = min(1.0, elapsed / 1.8)
-            if elapsed > 3.5:
-                self._state = "DESKTOP"
-        c = int(255 * self._opacity)
+        # Phase transitions
+        if self._phase == "BOOT" and elapsed > 2.2:
+            self._phase = "INTRO"
+        if self._phase == "INTRO" and elapsed > 4.5:
+            self._phase = "DESKTOP"
 
-        # Background grid
-        gc = int(18 * self._opacity)
-        for x in range(0, 1920, 80):
-            cv2.line(frame, (x,0), (x,1080), (0,gc,gc), 1)
-        for y in range(0, 1080, 80):
-            cv2.line(frame, (0,y), (1920,y), (0,gc,gc), 1)
+        self._circuit_engine = circuit_engine
+        self._circuit_active = circuit_active
 
-        # AR content in left pane
-        if ar_rgb is not None and self._state == "DESKTOP":
-            resized = cv2.resize(ar_rgb, (960, 600))
-            frame[80:680, 20:980] = resized
-            cv2.rectangle(frame, (20,80), (980,680), (0, c//4, c//2), 1)
+        frame = np.zeros((self.H, self.W, 3), dtype=np.uint8)
 
-        # Logo
-        logo_c = (0, int(200 * self._opacity), int(255 * self._opacity))
-        cv2.putText(frame, "AIILA", (1020, 260),
-                    cv2.FONT_HERSHEY_DUPLEX, 5, logo_c, 8, cv2.LINE_AA)
-        cv2.putText(frame, "NEURAL INTERFACE TERMINAL",
-                    (1020, 320), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                    (0, c//2, c//2), 1, cv2.LINE_AA)
+        self._draw_background(frame, elapsed)
 
-        if self._state == "DESKTOP":
-            d = min(1.0, (elapsed - 3.5) / 1.2)
-            dc = int(255 * d)
+        if self._phase == "BOOT":
+            self._draw_boot(frame, elapsed)
+        elif self._phase == "INTRO":
+            self._draw_intro(frame, elapsed)
+        else:
+            d = min(1.0, (elapsed - 4.5) / 1.0)
+            self._draw_desktop(frame, elapsed, ar_rgb, d,
+                               self._circuit_engine, self._circuit_active)
 
-            # Taskbar
-            cv2.rectangle(frame, (0, 1028), (1920, 1080), (0, int(25*d), int(30*d)), -1)
-            cv2.line(frame, (0,1028), (1920,1028), (0, int(60*d), int(80*d)), 1)
-            cv2.putText(frame, "AIILA OS  ▪  KERNEL READY  ▪  " + time.strftime("%H:%M:%S"),
-                        (40, 1058), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, dc//2, dc//2), 1)
+        # Always draw topbar + taskbar once past boot
+        if self._phase != "BOOT":
+            self._draw_topbar(frame, elapsed)
+            self._draw_taskbar(frame, elapsed)
 
-            # Open Apps button
-            bx, by, bw, bh = self._btn
-            cv2.rectangle(frame, (bx, by), (bx+bw, by+bh), (0, dc//2, dc), 1)
-            (tw, th), _ = cv2.getTextSize("OPEN APPS", cv2.FONT_HERSHEY_SIMPLEX, 0.65, 1)
-            cv2.putText(frame, "OPEN APPS",
-                        (bx + (bw-tw)//2, by + (bh+th)//2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, dc//2, dc), 1, cv2.LINE_AA)
+        qi = QImage(frame.data, self.W, self.H, self.W * 3, QImage.Format.Format_BGR888)
+        self._canvas.setPixmap(QPixmap.fromImage(qi.copy()))
 
-            # Circular app menu
-            if self._apps_vis or (time.time() - self._anim_start < 0.7):
-                t = min(1.0, (time.time() - self._anim_start) / 0.5)
-                if not self._apps_vis:
-                    t = 1.0 - t
-                r     = int(300 * t)
-                cx, cy = 1920//2, 500
-                sx, sy = bx + bw//2, by + bh//2
-                for i, name in enumerate(self._apps):
-                    ang = -150 + i * (360 / len(self._apps))
-                    rad = math.radians(ang)
-                    tx_ = int(cx + 300 * math.cos(rad))
-                    ty_ = int(cy + 300 * math.sin(rad))
-                    ax  = int(sx + (tx_ - sx) * t)
-                    ay  = int(sy + (ty_ - sy) * t)
-                    ac  = int(255 * t)
-                    cv2.circle(frame, (ax, ay), int(46*t), (0, int(200*t), int(255*t)), 2)
-                    if t > 0.75:
-                        (nw, nh), _ = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                        cv2.putText(frame, name, (ax - nw//2, ay + 64),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (ac, ac, ac), 1)
+    # ── BACKGROUND ──────────────────────────────────────────────────────────
+    def _draw_background(self, f: np.ndarray, t: float):
+        """Animated deep-space grid with slow parallax drift."""
+        drift_x = int(math.sin(t * 0.08) * 30)
+        drift_y = int(math.cos(t * 0.05) * 20)
+        gc = int(14 * self._fade)
+        ac = int(8  * self._fade)
 
-        h, w = frame.shape[:2]
-        qi   = QImage(frame.data, w, h, w*3, QImage.Format.Format_BGR888)
-        self._display.setPixmap(QPixmap.fromImage(qi.copy()))
+        # Major grid 120px
+        for x in range((drift_x % 120) - 120, self.W + 120, 120):
+            cv2.line(f, (x, 0), (x, self.H), (0, gc, gc), 1)
+        for y in range((drift_y % 120) - 120, self.H + 120, 120):
+            cv2.line(f, (0, y), (self.W, y), (0, gc, gc), 1)
+
+        # Minor grid 40px
+        for x in range((drift_x % 40) - 40, self.W + 40, 40):
+            cv2.line(f, (x, 0), (x, self.H), (0, ac, ac), 1)
+        for y in range((drift_y % 40) - 40, self.H + 40, 40):
+            cv2.line(f, (0, y), (self.W, y), (0, ac, ac), 1)
+
+        # Vignette — darken edges
+        cx, cy = self.W // 2, self.H // 2
+        for r, alpha in [(900, 0.18), (700, 0.10), (500, 0.05)]:
+            overlay = f.copy()
+            cv2.ellipse(overlay, (cx, cy), (r, int(r*0.56)), 0, 0, 360,
+                        (0, 0, 0), -1)
+            cv2.addWeighted(overlay, alpha, f, 1 - alpha, 0, f)
+
+    # ── BOOT SEQUENCE ────────────────────────────────────────────────────────
+    def _draw_boot(self, f: np.ndarray, t: float):
+        lines = [
+            (0.0, "AIILA NEURAL INTERFACE TERMINAL"),
+            (0.3, "Initialising hardware abstraction layer..."),
+            (0.6, "Loading hand landmarker model..."),
+            (0.9, "Calibrating gesture pipeline..."),
+            (1.2, "Mounting AR canvas..."),
+            (1.5, "Projector handshake..."),
+            (1.8, "All systems nominal."),
+            (2.0, "BOOT COMPLETE"),
+        ]
+        cy = 460
+        for delay, text in lines:
+            if t > delay:
+                a = min(1.0, (t - delay) / 0.25)
+                col_g = int(255 * a) if text == "BOOT COMPLETE" else int(160 * a)
+                col_b = int(255 * a)
+                col   = (0, col_g, col_b) if text != "BOOT COMPLETE" else (0, 255, 80)
+                th    = 2 if text == "BOOT COMPLETE" else 1
+                fs    = 0.8 if text == "BOOT COMPLETE" else 0.55
+                (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
+                cv2.putText(f, text, ((self.W - tw) // 2, cy),
+                            cv2.FONT_HERSHEY_SIMPLEX, fs, col, th, cv2.LINE_AA)
+            cy += 36
+
+    # ── INTRO SPLASH ─────────────────────────────────────────────────────────
+    def _draw_intro(self, f: np.ndarray, t: float):
+        a = min(1.0, (t - 2.2) / 0.8)
+        c = int(255 * a)
+
+        # Big logo
+        logo = "AIILA"
+        (lw, lh), _ = cv2.getTextSize(logo, cv2.FONT_HERSHEY_DUPLEX, 9, 14)
+        cv2.putText(f, logo, ((self.W - lw) // 2, 560),
+                    cv2.FONT_HERSHEY_DUPLEX, 9, (0, int(200*a), c), 14, cv2.LINE_AA)
+        cv2.putText(f, logo, ((self.W - lw) // 2, 560),
+                    cv2.FONT_HERSHEY_DUPLEX, 9, (0, int(220*a), c), 2, cv2.LINE_AA)
+
+        # Tagline
+        tag = "NEURAL INTERFACE TERMINAL  v2.4"
+        (tw, _), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 1)
+        cv2.putText(f, tag, ((self.W - tw) // 2, 620),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, int(130*a), int(160*a)), 1, cv2.LINE_AA)
+
+        # Horizontal rule
+        rx = (self.W - 500) // 2
+        cv2.line(f, (rx, 640), (rx + 500, 640), (0, int(80*a), int(120*a)), 1)
+
+    # ── TOP BAR ──────────────────────────────────────────────────────────────
+    def _draw_topbar(self, f: np.ndarray, t: float):
+        a   = min(1.0, (t - 2.2) / 0.6)
+        c   = int(255 * a)
+        dim = int(80  * a)
+
+        # Bar background
+        cv2.rectangle(f, (0, 0), (self.W, 48), (0, int(12*a), int(16*a)), -1)
+        cv2.line(f, (0, 48), (self.W, 48), (0, int(50*a), int(70*a)), 1)
+
+        # Logo left
+        cv2.putText(f, "AIILA", (16, 34),
+                    cv2.FONT_HERSHEY_DUPLEX, 1.1, (0, int(200*a), c), 2, cv2.LINE_AA)
+        cv2.putText(f, "OS", (102, 34),
+                    cv2.FONT_HERSHEY_DUPLEX, 1.1, (0, int(160*a), int(200*a)), 1, cv2.LINE_AA)
+
+        # Separator
+        cv2.line(f, (155, 10), (155, 38), (0, dim, dim), 1)
+
+        # Module name
+        cv2.putText(f, "NEURAL INTERFACE TERMINAL", (168, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, dim, dim), 1, cv2.LINE_AA)
+
+        # Clock right
+        ts = time.strftime("%H:%M:%S")
+        ds = time.strftime("%Y-%m-%d")
+        (tw, _), _ = cv2.getTextSize(ts, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 1)
+        cv2.putText(f, ts, (self.W - tw - 16, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, int(200*a), c), 1, cv2.LINE_AA)
+        (dw, _), _ = cv2.getTextSize(ds, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+        cv2.putText(f, ds, (self.W - dw - 16, 44),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, dim, dim), 1, cv2.LINE_AA)
+
+        # Status dots
+        for i, (lbl, col) in enumerate([
+            ("KERNEL", (0, 255, 120)),
+            ("AR",     (0, 200, 255)),
+            ("VOICE",  (0, 255, 200)),
+            ("CIRCUIT",(255, 200, 0)),
+        ]):
+            bx = self.W - 350 + i * 80
+            pulse = abs(math.sin(t * 2 + i)) * 0.4 + 0.6
+            dc = tuple(int(c2 * pulse * a) for c2 in col)
+            cv2.circle(f, (bx, 24), 5, dc, -1, cv2.LINE_AA)
+            cv2.putText(f, lbl, (bx + 8, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, dc, 1, cv2.LINE_AA)
+
+    # ── TASKBAR ──────────────────────────────────────────────────────────────
+    def _draw_taskbar(self, f: np.ndarray, t: float):
+        a   = min(1.0, (t - 2.2) / 0.6)
+        dim = int(80 * a)
+        c   = int(255 * a)
+        TY  = self.H - 40
+
+        cv2.rectangle(f, (0, TY), (self.W, self.H), (0, int(10*a), int(14*a)), -1)
+        cv2.line(f, (0, TY), (self.W, TY), (0, int(45*a), int(60*a)), 1)
+
+        uptime = t
+        h_ = int(uptime // 3600)
+        m_ = int((uptime % 3600) // 60)
+        s_ = int(uptime % 60)
+        items = [
+            f"UPTIME  {h_:02d}:{m_:02d}:{s_:02d}",
+            "GESTURE  READY",
+            "AR MODE  DEFAULT",
+            "KERNEL  NOMINAL",
+            "v2.4.0-RELEASE",
+        ]
+        spacing = self.W // len(items)
+        for i, txt in enumerate(items):
+            x = spacing * i + 20
+            cv2.putText(f, txt, (x, TY + 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, dim, int(c * 0.7)), 1, cv2.LINE_AA)
+            if i > 0:
+                cv2.line(f, (spacing * i, TY + 6), (spacing * i, self.H - 6),
+                         (0, int(30*a), int(40*a)), 1)
+
+    # ── FULL DESKTOP ─────────────────────────────────────────────────────────
+    def _draw_desktop(self, f: np.ndarray, t: float,
+                      ar_rgb: np.ndarray | None, d: float,
+                      circuit_engine=None, circuit_active: bool = False):
+        c   = int(255 * d)
+        dim = int(120 * d)
+
+        # ── AR FEED panel (left) ─────────────────────────────────────────────
+        PAD, TBH, BTH = 12, 48, 40
+        feed_x1, feed_y1 = PAD,       TBH + PAD
+        feed_x2, feed_y2 = 980,       TBH + PAD + 600
+
+        # Panel border + corner brackets
+        cv2.rectangle(f, (feed_x1, feed_y1), (feed_x2, feed_y2),
+                      (0, int(40*d), int(60*d)), 1)
+        self._corner_brackets(f, feed_x1, feed_y1, feed_x2, feed_y2,
+                               (0, int(200*d), c), 20, 2)
+
+        # AR content or placeholder
+        if ar_rgb is not None:
+            try:
+                roi = cv2.resize(ar_rgb, (feed_x2 - feed_x1 - 2, feed_y2 - feed_y1 - 2))
+                f[feed_y1+1:feed_y2, feed_x1+1:feed_x2] = roi
+            except Exception:
+                pass
+        else:
+            cx_, cy_ = (feed_x1 + feed_x2) // 2, (feed_y1 + feed_y2) // 2
+            r = int(60 + 10 * math.sin(t * 2))
+            cv2.circle(f, (cx_, cy_), r, (0, dim//2, dim), 1, cv2.LINE_AA)
+            cv2.line(f, (cx_ - r - 20, cy_), (cx_ + r + 20, cy_), (0, dim//2, dim), 1)
+            cv2.line(f, (cx_, cy_ - r - 20), (cx_, cy_ + r + 20), (0, dim//2, dim), 1)
+            cv2.putText(f, "AWAITING AR FEED", (cx_ - 100, cy_ + r + 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, dim, dim), 1, cv2.LINE_AA)
+
+        cv2.putText(f, "AR LIVE FEED", (feed_x1 + 4, feed_y1 - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, dim, dim), 1, cv2.LINE_AA)
+
+        sy = feed_y1 + int((t * 80) % (feed_y2 - feed_y1))
+        scan_ov = f.copy()
+        cv2.line(scan_ov, (feed_x1, sy), (feed_x2, sy), (0, 200, 255), 1)
+        cv2.addWeighted(scan_ov, 0.25, f, 0.75, 0, f)
+
+        # ── RIGHT PANEL ──────────────────────────────────────────────────────
+        RX = 996
+        RW = self.W - RX - PAD
+
+        if circuit_active and circuit_engine is not None:
+            # ─ CIRCUIT BOARD (top of right panel) ────────────────────────────
+            self._draw_circuit_panel(f, t, d, RX, TBH + PAD, RW, circuit_engine)
+        else:
+            # ─ METRICS + LOG + DOCK ───────────────────────────────────────────
+            self._draw_metrics(f, t, d, RX, TBH + PAD, RW)
+            log_y1 = TBH + PAD + 260
+            log_y2 = TBH + PAD + 530
+            self._draw_kernel_log(f, d, RX, log_y1, RW, log_y2)
+            dock_y = TBH + PAD + 545
+            self._draw_app_dock(f, t, d, RX, dock_y, RW)
+
+    # ── METRICS PANEL ────────────────────────────────────────────────────────
+    def _draw_metrics(self, f: np.ndarray, t: float, d: float,
+                      rx: int, ry: int, rw: int):
+        c   = int(255 * d)
+        dim = int(100 * d)
+
+        # Panel border
+        ph = 250
+        cv2.rectangle(f, (rx, ry), (rx + rw, ry + ph), (0, int(30*d), int(45*d)), 1)
+        self._corner_brackets(f, rx, ry, rx + rw, ry + ph, (0, int(180*d), c), 14, 1)
+        cv2.putText(f, "SYSTEM METRICS", (rx + 6, ry - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, dim, dim), 1, cv2.LINE_AA)
+
+        # Animate metric histories
+        keys   = ["CPU", "GPU", "MEM", "NET"]
+        colors = [(0, 200, 255), (0, 255, 140), (255, 180, 0), (200, 80, 255)]
+        bases  = [45.0, 62.0, 71.0, 30.0]
+        amps   = [25.0, 18.0, 8.0, 35.0]
+        freqs  = [0.7,  0.5,  0.2,  1.1]
+
+        for ki, key in enumerate(keys):
+            val = bases[ki] + amps[ki] * (0.5 + 0.5 * math.sin(t * freqs[ki] + ki))
+            self._metric_hist[key].append(val)
+            self._metric_hist[key] = self._metric_hist[key][-80:]
+
+        # Draw 4 graphs in 2×2 grid
+        gw, gh = rw // 2 - 14, 100
+        for i, (key, col) in enumerate(zip(keys, colors)):
+            gx = rx + 8  + (i % 2) * (gw + 12)
+            gy = ry + 14 + (i // 2) * (gh + 18)
+            hist = self._metric_hist[key]
+            val  = hist[-1]
+
+            # Background
+            cv2.rectangle(f, (gx, gy), (gx + gw, gy + gh),
+                          (0, int(8*d), int(12*d)), -1)
+            cv2.rectangle(f, (gx, gy), (gx + gw, gy + gh),
+                          tuple(int(c2 * 0.25 * d) for c2 in col), 1)
+
+            # Waveform
+            pts = []
+            for j, v in enumerate(hist):
+                px_ = gx + int(j * gw / max(len(hist)-1, 1))
+                py_ = gy + gh - 4 - int(v / 100 * (gh - 8))
+                pts.append((px_, py_))
+            if len(pts) > 1:
+                for j in range(len(pts) - 1):
+                    cv2.line(f, pts[j], pts[j+1],
+                             tuple(int(c2 * d) for c2 in col), 1, cv2.LINE_AA)
+
+            # Fill under curve
+            fill_pts = [(gx, gy+gh-4)] + pts + [(gx+gw, gy+gh-4)]
+            fill_arr = np.array(fill_pts, dtype=np.int32)
+            ov = f.copy()
+            cv2.fillPoly(ov, [fill_arr], tuple(int(c2 * 0.12 * d) for c2 in col))
+            cv2.addWeighted(ov, 0.6, f, 0.4, 0, f)
+
+            # Labels
+            cv2.putText(f, key, (gx + 4, gy + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                        tuple(int(c2 * 0.7 * d) for c2 in col), 1, cv2.LINE_AA)
+            pct_str = f"{val:.0f}%"
+            (pw, _), _ = cv2.getTextSize(pct_str, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            cv2.putText(f, pct_str, (gx + gw - pw - 4, gy + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                        tuple(int(c2 * d) for c2 in col), 1, cv2.LINE_AA)
+
+            # Threshold line at 80%
+            ty_ = gy + gh - 4 - int(0.80 * (gh - 8))
+            cv2.line(f, (gx, ty_), (gx + gw, ty_),
+                     tuple(int(c2 * 0.3 * d) for c2 in col), 1)
+
+    # ── KERNEL LOG ───────────────────────────────────────────────────────────
+    def _draw_kernel_log(self, f: np.ndarray, d: float,
+                          rx: int, y1: int, rw: int, y2: int):
+        dim = int(100 * d)
+        c   = int(255 * d)
+        cv2.rectangle(f, (rx, y1), (rx + rw, y2), (0, int(25*d), int(35*d)), -1)
+        cv2.rectangle(f, (rx, y1), (rx + rw, y2), (0, int(40*d), int(55*d)), 1)
+        self._corner_brackets(f, rx, y1, rx + rw, y2, (0, int(160*d), c), 12, 1)
+        cv2.putText(f, "KERNEL LOG", (rx + 6, y1 - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, dim, dim), 1, cv2.LINE_AA)
+
+        line_h = 18
+        visible = (y2 - y1 - 10) // line_h
+        lines   = self._log_lines[-visible:]
+        for i, line in enumerate(lines):
+            ly = y1 + 14 + i * line_h
+            if "[OK]" in line or "[READY]" in line:
+                col = (0, int(200*d), int(80*d))
+            elif "[ERR]" in line or "[FAIL]" in line:
+                col = (0, int(60*d), int(255*d))
+            else:
+                col = (0, int(140*d), int(160*d))
+            # Truncate to fit panel
+            disp = line[:int(rw / 7)]
+            cv2.putText(f, disp, (rx + 8, ly),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, col, 1, cv2.LINE_AA)
+
+        # Blinking cursor on last line
+        cy_ = y1 + 14 + len(lines) * line_h
+        if int(time.time() * 2) % 2:
+            cv2.putText(f, "▌", (rx + 8, cy_),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.32,
+                        (0, int(200*d), int(80*d)), 1, cv2.LINE_AA)
+
+    # ── APP DOCK ─────────────────────────────────────────────────────────────
+    def _draw_app_dock(self, f: np.ndarray, t: float, d: float,
+                        rx: int, ry: int, rw: int):
+        c    = int(255 * d)
+        cols = 4
+        rows = math.ceil(len(self.APPS) / cols)
+        cell_w = rw // cols
+        cell_h = 56
+        total_h = rows * cell_h + 20
+
+        cv2.rectangle(f, (rx, ry), (rx + rw, ry + total_h),
+                      (0, int(20*d), int(28*d)), -1)
+        cv2.rectangle(f, (rx, ry), (rx + rw, ry + total_h),
+                      (0, int(35*d), int(50*d)), 1)
+        self._corner_brackets(f, rx, ry, rx + rw, ry + total_h,
+                               (0, int(150*d), c), 12, 1)
+        cv2.putText(f, "APP DOCK", (rx + 6, ry - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                    (0, int(100*d), int(120*d)), 1, cv2.LINE_AA)
+
+        self._dock_rects.clear()
+        for i, (name, icon, accent) in enumerate(self.APPS):
+            col_i = i % cols
+            row_i = i // cols
+            cx_   = rx + col_i * cell_w + cell_w // 2
+            cy_   = ry + 14 + row_i * cell_h + cell_h // 2
+
+            is_hov = (i == self._hovered_app)
+            is_act = (i == self._active_app)
+
+            # Hover / active glow pulse
+            if is_hov or is_act:
+                pulse = 0.6 + 0.4 * abs(math.sin(t * 4))
+                gc_   = tuple(int(v * pulse * d) for v in accent)
+                cv2.circle(f, (cx_, cy_), 26, gc_, 1, cv2.LINE_AA)
+                cv2.circle(f, (cx_, cy_), 22,
+                           tuple(int(v * 0.18 * d) for v in accent), -1)
+            else:
+                cv2.circle(f, (cx_, cy_), 22,
+                           (0, int(18*d), int(24*d)), -1)
+                cv2.circle(f, (cx_, cy_), 22,
+                           tuple(int(v * 0.35 * d) for v in accent), 1, cv2.LINE_AA)
+
+            # Icon text (use first char as stand-in since cv2 can't render Unicode well)
+            icon_ch = name[0]
+            (iw, ih), _ = cv2.getTextSize(icon_ch, cv2.FONT_HERSHEY_DUPLEX, 0.7, 1)
+            cv2.putText(f, icon_ch, (cx_ - iw//2, cy_ + ih//2),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.7,
+                        tuple(int(v * d) for v in accent), 1, cv2.LINE_AA)
+
+            # Label
+            (nw, _), _ = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, 0.28, 1)
+            cv2.putText(f, name, (cx_ - nw//2, cy_ + 32),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28,
+                        tuple(int(v * 0.7 * d) for v in accent), 1, cv2.LINE_AA)
+
+            self._dock_rects.append((cx_ - 24, cy_ - 24, cx_ + 24, cy_ + 24))
+
+    # ── UTILITY ──────────────────────────────────────────────────────────────
+    # ── CIRCUIT PANEL (right column when circuit mode is active) ─────────────
+    def _draw_circuit_panel(self, f: np.ndarray, t: float, d: float,
+                             rx: int, ry: int, rw: int, engine):
+        """Renders circuit board mini-view + component picker list on projector."""
+        c   = int(255 * d)
+        dim = int(120 * d)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        # ── Mini circuit board view (top 380px) ─────────────────────────────
+        bh = 380
+        cv2.rectangle(f, (rx, ry), (rx + rw, ry + bh), (0, int(18*d), int(28*d)), -1)
+        cv2.rectangle(f, (rx, ry), (rx + rw, ry + bh), (0, int(120*d), c), 1)
+        self._corner_brackets(f, rx, ry, rx + rw, ry + bh,
+                               (0, int(200*d), c), 14, 1)
+        cv2.putText(f, "CIRCUIT BOARD", (rx + 6, ry - 6),
+                    font, 0.38, (0, dim, dim), 1, cv2.LINE_AA)
+
+        # Render the circuit engine into a temp canvas, then paste
+        try:
+            tmp = np.zeros((bh - 2, rw - 2, 3), dtype=np.uint8)
+            # Save + override engine canvas size temporarily
+            orig_w, orig_h = engine.canvas_w, engine.canvas_h
+            engine.canvas_w = rw - 2
+            engine.canvas_h = bh - 2
+            engine.render_board_only(tmp)
+            engine.canvas_w, engine.canvas_h = orig_w, orig_h
+            f[ry+1:ry+bh-1, rx+1:rx+rw-1] = tmp
+        except Exception:
+            cv2.putText(f, "CIRCUIT ENGINE", (rx + rw//2 - 60, ry + bh//2),
+                        font, 0.5, (0, int(100*d), int(120*d)), 1, cv2.LINE_AA)
+
+        # ── Component picker list (below board) ─────────────────────────────
+        py  = ry + bh + 10
+        ph  = self.H - py - 50    # remaining space
+        cv2.rectangle(f, (rx, py), (rx + rw, py + ph), (0, int(12*d), int(18*d)), -1)
+        cv2.rectangle(f, (rx, py), (rx + rw, py + ph), (0, int(60*d), int(80*d)), 1)
+        cv2.putText(f, "COMPONENTS", (rx + 6, py - 6),
+                    font, 0.38, (0, dim, dim), 1, cv2.LINE_AA)
+
+        # Selected component highlight
+        sel = getattr(engine, 'panel_selected', 'resistor')
+        sel_comp_name = ""
+
+        # Draw component list (compact rows)
+        row_h   = 22
+        visible = max(1, (ph - 6) // row_h)
+        items   = [it for it in engine._panel_items if it[0] == "comp"]
+
+        # Find selected index for scroll centering
+        sel_idx = next((i for i, it in enumerate(items) if it[1] == sel), 0)
+        start   = max(0, sel_idx - visible // 2)
+        end     = min(len(items), start + visible)
+
+        for i, (kind, tid, lbl) in enumerate(items[start:end]):
+            iy = py + 4 + i * row_h
+            if iy + row_h > py + ph:
+                break
+            is_sel = (tid == sel)
+            bg = (0, int(35*d), int(55*d)) if is_sel else (0, 0, 0)
+            cv2.rectangle(f, (rx + 1, iy), (rx + rw - 1, iy + row_h - 1), bg, -1)
+
+            d_ = engine.CATALOG.get(tid, {}) if hasattr(engine, 'CATALOG') else {}
+            from core.circuit_engine import CATALOG as _CAT
+            d_ = _CAT.get(tid, {})
+            col = d_.get("color", (80, 80, 80))
+            # Swatch
+            cv2.rectangle(f, (rx + 4, iy + 5), (rx + 14, iy + row_h - 5),
+                          tuple(int(cc * d) for cc in col), -1)
+            # Name
+            text_c = (0, int(200*d), c) if is_sel else (int(160*d), int(200*d), int(220*d))
+            cv2.putText(f, lbl[:14], (rx + 18, iy + 15),
+                        font, 0.30, text_c, 1, cv2.LINE_AA)
+            # Sim state badge if running
+            if engine.sim_running and is_sel:
+                cv2.putText(f, "►SIM", (rx + rw - 42, iy + 15),
+                            font, 0.25, (80, 255, 80), 1, cv2.LINE_AA)
+
+        # Scroll indicator
+        if len(items) > visible:
+            bar_h = max(8, int(ph * visible / len(items)))
+            bar_y = py + int(start / len(items) * ph)
+            cv2.rectangle(f, (rx + rw - 4, bar_y), (rx + rw - 2, bar_y + bar_h),
+                          (0, int(100*d), c), -1)
+
+        # Sim status badge
+        if engine.sim_running:
+            elapsed = time.time() - engine._sim_t0
+            pulse   = 0.6 + 0.4 * abs(math.sin(elapsed * 3))
+            sc      = tuple(int(cc * pulse * d) for cc in (80, 255, 80))
+            cv2.circle(f, (rx + rw - 14, ry + 8), 5, sc, -1, cv2.LINE_AA)
+            cv2.putText(f, f"SIM {elapsed:.0f}s", (rx + rw - 60, ry + 12),
+                        font, 0.28, sc, 1, cv2.LINE_AA)
+
+    @staticmethod
+    def _corner_brackets(f, x1, y1, x2, y2, col, size, thick):
+        for pts in [
+            [(x1, y1+size),(x1,y1),(x1+size,y1)],
+            [(x2-size,y1),(x2,y1),(x2,y1+size)],
+            [(x1,y2-size),(x1,y2),(x1+size,y2)],
+            [(x2-size,y2),(x2,y2),(x2,y2-size)],
+        ]:
+            for i in range(len(pts)-1):
+                cv2.line(f, pts[i], pts[i+1], col, thick, cv2.LINE_AA)
+
+    def push_log(self, line: str):
+        self._log_lines.append(line)
+        if len(self._log_lines) > 200:
+            self._log_lines = self._log_lines[-150:]
+
+    # ── INPUT ────────────────────────────────────────────────────────────────
+    def mouseMoveEvent(self, event):
+        if self._phase != "DESKTOP":
+            return
+        x, y = event.pos().x(), event.pos().y()
+        self._hovered_app = -1
+        for i, (x1, y1, x2, y2) in enumerate(self._dock_rects):
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                self._hovered_app = i
+                break
+        self.setMouseTracking(True)
 
     def mousePressEvent(self, event):
-        if self._state == "DESKTOP":
-            x, y = event.pos().x(), event.pos().y()
-            bx, by, bw, bh = self._btn
-            if bx <= x <= bx+bw and by <= y <= by+bh:
-                self._apps_vis   = not self._apps_vis
-                self._anim_start = time.time()
+        if self._phase != "DESKTOP":
+            return
+        x, y = event.pos().x(), event.pos().y()
+        for i, (x1, y1, x2, y2) in enumerate(self._dock_rects):
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                self._active_app = i if self._active_app != i else -1
+                self.push_log(f"APP LAUNCHED: {self.APPS[i][0]}")
+                return
 
     def mouseDoubleClickEvent(self, e):
         self.close()
@@ -752,11 +1263,13 @@ class UIHub(QMainWindow):
             if data:
                 p_rgb, ar_rgb, cam_rgb, state = data
 
-                # Projector
-                if p_rgb is not None and self.projector_window:
-                    self.projector_window.update_display(p_rgb)
-                elif self.projector_window:
-                    self.projector_window.update_display(None)
+                # Projector — pass circuit engine so it can render the panel
+                if self.projector_window:
+                    self.projector_window.update_display(
+                        p_rgb,
+                        self.kernel.circuit_engine if self._circuit_active else None,
+                        self._circuit_active,
+                    )
 
                 # Main viewport
                 self.viewport.set_frame(_ndarray_to_pixmap(ar_rgb))
@@ -768,6 +1281,8 @@ class UIHub(QMainWindow):
                 fb = state.get('voice_feedback', '')
                 if fb:
                     self.sidebar.terminal.push(fb)
+                    if self.projector_window:
+                        self.projector_window.push_log(fb)
 
                 # Metrics
                 self.sidebar.update_metrics(fps, state)
