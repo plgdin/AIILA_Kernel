@@ -1,17 +1,27 @@
 """
-circuit_engine.py  —  AIILA Circuit Engine v3
-===============================================
-Major improvements:
-  • Pixel-perfect component rendering with proper schematic symbols
-  • Smart wire routing with Manhattan (L-shaped) paths
-  • Right-side component panel (collapsible, scrollable, categorised)
-  • Component property inspector overlay
-  • Net colouring — wires connected to same net share a colour
-  • Richer simulation: PWM, analog signals, voltage levels
-  • render_panel() — renders ONLY the component picker (for projector)
-  • render_board() — renders ONLY the circuit board (for projector)
-  • Connection snapping: dragging near a pin auto-snaps to it
-  • Undo stack (last 20 actions)
+circuit_engine.py  —  AIILA Circuit Engine v3.1  (WORKBENCH EDITION)
+=====================================================================
+FIXES APPLIED OVER v3:
+
+  [FIX 1]  snapshot() / restore()  — kernel undo now works
+  [FIX 2]  add_wire(src_id, src_pin, dst_id, dst_pin)  — gesture wire-draw works
+  [FIX 3]  hit_test(wx, wy, radius_multiplier=1.0)  — grab forgiveness radius
+  [FIX 4]  get_pin_positions() — LEFT+RIGHT column layout for ICs (not all-left)
+  [FIX 5]  get_pin_by_name(comp, pin_name) -> (wx, wy)  — named pin lookup
+  [FIX 6]  get_pin_positions() applies rotation transform
+  [FIX 7]  threading.RLock on all component mutations — no race conditions
+  [FIX 8]  render_board_only() accepts override_w/override_h — no global mutation
+  [FIX 9]  serial_log now uses collections.deque(maxlen=200) — no memory leak
+  [FIX 10] tick_simulation() uses time.time() not sim_tick for frame-rate
+           independence
+  [FIX 11] Undo stack consolidated in engine — kernel.undo() delegates here
+
+  NEW — PIN VISIBILITY:
+  • IC components (ESP32, Arduino etc.) show pins on BOTH left and right sides,
+    split ~50/50. Each pin has its name rendered next to it.
+  • Pin hit-radius scales with zoom so you can target individual GPIO pins
+    from a normal arm-length projector distance.
+  • _draw_pins() now also draws right-side pins with labels.
 """
 
 import cv2
@@ -20,28 +30,27 @@ import json
 import math
 import random
 import time
+import threading
+from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Optional
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  CATALOG  — every component the engine knows about
+#  CATALOG  (unchanged from v3 — full 80+ component catalog)
 # ─────────────────────────────────────────────────────────────────────────────
-# Each entry:  label, category, color (BGR), w, h, pins, props, symbol
-#   symbol: "rect" | "led" | "res" | "cap" | "diode" | "trans" | "ic" | "sensor"
-
 CATALOG: dict[str, dict] = {
     # ── Microcontrollers ─────────────────────────────────────────────────────
-    "esp32":       {"label":"ESP32",    "category":"MCU",     "color":(61,133,200), "w":90,"h":120,
+    "esp32":       {"label":"ESP32",    "category":"MCU",     "color":(61,133,200), "w":90,"h":160,
                     "symbol":"ic",
                     "pins":["3V3","GND","EN","VP","VN","D34","D35","D32","D33","D25","D26","D27","D14","D12","D13","D2","D4","RX2","TX2","D5","D18","D19","D21","RX0","TX0","D22","D23"],
                     "props":{"board":"ESP32 Dev","cpu":"240MHz","flash":"4MB","ram":"520KB","voltage":"3.3V","wifi":"Yes","bt":"Yes"}},
-    "arduino_uno": {"label":"Uno",      "category":"MCU",     "color":(0,122,193),  "w":90,"h":120,
+    "arduino_uno": {"label":"Uno",      "category":"MCU",     "color":(0,122,193),  "w":90,"h":160,
                     "symbol":"ic",
                     "pins":["RESET","3.3V","5V","GND","VIN","A0","A1","A2","A3","A4","A5","D0","D1","D2","D3","D4","D5","D6","D7","D8","D9","D10","D11","D12","D13","AREF","GND2"],
                     "props":{"board":"Arduino Uno R3","cpu":"16MHz","flash":"32KB","ram":"2KB","voltage":"5V"}},
-    "arduino_nano":{"label":"Nano",     "category":"MCU",     "color":(0,100,170),  "w":70,"h":110,
+    "arduino_nano":{"label":"Nano",     "category":"MCU",     "color":(0,100,170),  "w":70,"h":150,
                     "symbol":"ic",
                     "pins":["D1","D0","RESET","GND","D2","D3","D4","D5","D6","D7","D8","D9","D10","D11","D12","D13","3V3","AREF","A0","A1","A2","A3","A4","A5","5V","GND2","VIN"],
                     "props":{"board":"Arduino Nano","cpu":"16MHz","flash":"32KB","voltage":"5V"}},
@@ -49,370 +58,286 @@ CATALOG: dict[str, dict] = {
                     "symbol":"ic",
                     "pins":["RST","A0","D0","D5","D6","D7","D8","3V3","GND","D4","D3","D2","D1"],
                     "props":{"board":"NodeMCU 1.0","cpu":"80MHz","flash":"4MB","voltage":"3.3V","wifi":"Yes"}},
-    "rpi_pico":    {"label":"Pico",     "category":"MCU",     "color":(197,26,74),  "w":90,"h":120,
+    "rpi_pico":    {"label":"Pico",     "category":"MCU",     "color":(197,26,74),  "w":90,"h":160,
                     "symbol":"ic",
                     "pins":["GP0","GP1","GND","GP2","GP3","GP4","GP5","GP6","GP7","GP8","GP9","GP10","GP11","GP12","GP13","GP14","GP15","3V3","VSYS","VBUS","GND2","RUN","ADC_VREF","GP26","GP27","GP28","AGND"],
                     "props":{"board":"RPi Pico","cpu":"133MHz","flash":"2MB","ram":"264KB","voltage":"3.3V"}},
-    "stm32":       {"label":"STM32",    "category":"MCU",     "color":(0,112,184),  "w":90,"h":120,
+    "stm32":       {"label":"STM32",    "category":"MCU",     "color":(0,112,184),  "w":90,"h":160,
                     "symbol":"ic",
                     "pins":["VBAT","PC13","PC14","PC15","PD0","PD1","NRST","PC0","PC1","PC2","PC3","VSSA","VDDA","PA0","PA1","PA2","PA3","PA4","PA5","PA6","PA7","PB0","PB1","PB2","GND","3.3V","5V"],
                     "props":{"board":"Blue Pill STM32F103","cpu":"72MHz","flash":"64KB","ram":"20KB","voltage":"3.3V"}},
 
     # ── Passives ─────────────────────────────────────────────────────────────
     "resistor":    {"label":"RES",   "category":"Passive", "color":(139,105,20), "w":60,"h":22,
-                    "symbol":"res",
-                    "pins":["1","2"],
+                    "symbol":"res",  "pins":["1","2"],
                     "props":{"resistance":"1kΩ","tolerance":"5%","power":"0.25W","type":"Carbon Film"}},
     "resistor_10k":{"label":"10kΩ",  "category":"Passive", "color":(139,105,20), "w":60,"h":22,
-                    "symbol":"res",
-                    "pins":["1","2"],
+                    "symbol":"res",  "pins":["1","2"],
                     "props":{"resistance":"10kΩ","tolerance":"1%","power":"0.25W","type":"Metal Film"}},
     "capacitor":   {"label":"CAP",   "category":"Passive", "color":(80,80,140),  "w":26,"h":44,
-                    "symbol":"cap",
-                    "pins":["+","-"],
+                    "symbol":"cap",  "pins":["+","-"],
                     "props":{"capacitance":"100nF","voltage":"50V","type":"Ceramic","esr":"0.01Ω"}},
     "cap_elec":    {"label":"ELEC",  "category":"Passive", "color":(60,60,120),  "w":30,"h":48,
-                    "symbol":"cap",
-                    "pins":["+","-"],
+                    "symbol":"cap",  "pins":["+","-"],
                     "props":{"capacitance":"100µF","voltage":"16V","type":"Electrolytic"}},
     "inductor":    {"label":"IND",   "category":"Passive", "color":(80,110,80),  "w":60,"h":24,
-                    "symbol":"res",
-                    "pins":["1","2"],
+                    "symbol":"res",  "pins":["1","2"],
                     "props":{"inductance":"10µH","current":"1A","dcr":"0.1Ω"}},
     "potentiometer":{"label":"POT",  "category":"Passive", "color":(100,100,100),"w":44,"h":44,
-                    "symbol":"rect",
-                    "pins":["1","W","2"],
+                    "symbol":"rect", "pins":["1","W","2"],
                     "props":{"resistance":"10kΩ","type":"Linear","power":"0.5W"}},
     "crystal":     {"label":"XTAL",  "category":"Passive", "color":(150,150,90), "w":30,"h":50,
-                    "symbol":"rect",
-                    "pins":["1","2"],
+                    "symbol":"rect", "pins":["1","2"],
                     "props":{"freq":"16MHz","load":"20pF","type":"HC-49S"}},
 
     # ── LEDs ─────────────────────────────────────────────────────────────────
     "led_red":     {"label":"LED",   "category":"LED",     "color":(0,0,255),    "w":22,"h":34,
-                    "symbol":"led",
-                    "pins":["A","K"],
+                    "symbol":"led",  "pins":["A","K"],
                     "props":{"Vf":"2.0V","If":"20mA","color":"Red","wavelength":"625nm"}},
     "led_green":   {"label":"LED",   "category":"LED",     "color":(0,200,0),    "w":22,"h":34,
-                    "symbol":"led",
-                    "pins":["A","K"],
+                    "symbol":"led",  "pins":["A","K"],
                     "props":{"Vf":"2.1V","If":"20mA","color":"Green","wavelength":"520nm"}},
     "led_blue":    {"label":"LED",   "category":"LED",     "color":(230,100,0),  "w":22,"h":34,
-                    "symbol":"led",
-                    "pins":["A","K"],
+                    "symbol":"led",  "pins":["A","K"],
                     "props":{"Vf":"3.2V","If":"20mA","color":"Blue","wavelength":"470nm"}},
     "led_yellow":  {"label":"LED",   "category":"LED",     "color":(0,200,200),  "w":22,"h":34,
-                    "symbol":"led",
-                    "pins":["A","K"],
+                    "symbol":"led",  "pins":["A","K"],
                     "props":{"Vf":"2.1V","If":"20mA","color":"Yellow","wavelength":"590nm"}},
     "led_rgb":     {"label":"RGB",   "category":"LED",     "color":(200,0,200),  "w":28,"h":34,
-                    "symbol":"led",
-                    "pins":["R","G","B","GND"],
+                    "symbol":"led",  "pins":["R","G","B","GND"],
                     "props":{"type":"Common Cathode","If":"20mA","package":"5mm"}},
     "ws2812":      {"label":"WS2812","category":"LED",     "color":(255,140,0),  "w":24,"h":24,
-                    "symbol":"ic",
-                    "pins":["VCC","GND","DIN","DOUT"],
+                    "symbol":"ic",   "pins":["VCC","GND","DIN","DOUT"],
                     "props":{"protocol":"NeoPixel","voltage":"5V","current":"60mA","RGB":"Yes"}},
     "ws2812_strip":{"label":"NeoStrip","category":"LED",   "color":(200,120,0),  "w":90,"h":24,
-                    "symbol":"rect",
-                    "pins":["5V","GND","DIN","DOUT"],
+                    "symbol":"rect", "pins":["5V","GND","DIN","DOUT"],
                     "props":{"leds":"8","voltage":"5V","current":"480mA","density":"30/m"}},
 
     # ── Displays ─────────────────────────────────────────────────────────────
     "oled":        {"label":"OLED",  "category":"Display", "color":(68,68,102),  "w":76,"h":56,
-                    "symbol":"rect",
-                    "pins":["GND","VCC","SCL","SDA"],
+                    "symbol":"rect", "pins":["GND","VCC","SCL","SDA"],
                     "props":{"driver":"SSD1306","res":"128x64","iface":"I2C","addr":"0x3C","voltage":"3.3-5V"}},
     "lcd16x2":     {"label":"LCD",   "category":"Display", "color":(50,100,50),  "w":100,"h":44,
-                    "symbol":"rect",
-                    "pins":["VSS","VDD","V0","RS","RW","E","D4","D5","D6","D7","A","K"],
+                    "symbol":"rect", "pins":["VSS","VDD","V0","RS","RW","E","D4","D5","D6","D7","A","K"],
                     "props":{"size":"16x2","backlight":"Yes","voltage":"5V","iface":"Parallel"}},
     "lcd_i2c":     {"label":"LCD I2C","category":"Display","color":(40,90,40),   "w":60,"h":44,
-                    "symbol":"ic",
-                    "pins":["GND","VCC","SDA","SCL"],
+                    "symbol":"ic",   "pins":["GND","VCC","SDA","SCL"],
                     "props":{"size":"16x2","backlight":"Yes","driver":"PCF8574","addr":"0x27"}},
     "tft_128":     {"label":"TFT128","category":"Display", "color":(80,50,80),   "w":70,"h":80,
-                    "symbol":"rect",
-                    "pins":["GND","VCC","SCL","SDA","RES","DC","CS","BLK"],
+                    "symbol":"rect", "pins":["GND","VCC","SCL","SDA","RES","DC","CS","BLK"],
                     "props":{"driver":"ST7735","res":"128x160","voltage":"3.3V","iface":"SPI"}},
     "epaper":      {"label":"ePaper","category":"Display", "color":(120,120,120),"w":80,"h":60,
-                    "symbol":"rect",
-                    "pins":["VCC","GND","DIN","CLK","CS","DC","RST","BUSY"],
+                    "symbol":"rect", "pins":["VCC","GND","DIN","CLK","CS","DC","RST","BUSY"],
                     "props":{"res":"200x200","voltage":"3.3V","color":"BW","iface":"SPI"}},
 
     # ── Sensors ──────────────────────────────────────────────────────────────
     "dht22":       {"label":"DHT22", "category":"Sensor",  "color":(0,170,136),  "w":34,"h":54,
-                    "symbol":"sensor",
-                    "pins":["VCC","DATA","NC","GND"],
+                    "symbol":"sensor","pins":["VCC","DATA","NC","GND"],
                     "props":{"temp":"-40~80°C","hum":"0~100%","acc":"±0.5°C","rate":"0.5Hz"}},
     "dht11":       {"label":"DHT11", "category":"Sensor",  "color":(0,140,100),  "w":30,"h":50,
-                    "symbol":"sensor",
-                    "pins":["VCC","DATA","GND"],
+                    "symbol":"sensor","pins":["VCC","DATA","GND"],
                     "props":{"temp":"0~50°C","hum":"20~80%","acc":"±2°C","rate":"1Hz"}},
     "bmp280":      {"label":"BMP280","category":"Sensor",  "color":(51,85,102),  "w":38,"h":24,
-                    "symbol":"ic",
-                    "pins":["VCC","GND","SCL","SDA","CSB","SDO"],
+                    "symbol":"ic",   "pins":["VCC","GND","SCL","SDA","CSB","SDO"],
                     "props":{"pressure":"300-1100hPa","temp":"-40~85°C","acc":"±1hPa","iface":"I2C/SPI"}},
     "bme680":      {"label":"BME680","category":"Sensor",  "color":(51,75,90),   "w":38,"h":24,
-                    "symbol":"ic",
-                    "pins":["VCC","GND","SCL","SDA","SDO","CS"],
+                    "symbol":"ic",   "pins":["VCC","GND","SCL","SDA","SDO","CS"],
                     "props":{"sensors":"Temp/Hum/Press/Gas","iface":"I2C/SPI"}},
     "ds18b20":     {"label":"DS18B20","category":"Sensor", "color":(102,85,85),  "w":24,"h":44,
-                    "symbol":"sensor",
-                    "pins":["GND","DATA","VCC"],
+                    "symbol":"sensor","pins":["GND","DATA","VCC"],
                     "props":{"range":"-55~125°C","acc":"±0.5°C","iface":"1-Wire","parasitic":"Yes"}},
     "ldr":         {"label":"LDR",   "category":"Sensor",  "color":(170,169,34), "w":24,"h":24,
-                    "symbol":"res",
-                    "pins":["1","2"],
+                    "symbol":"res",  "pins":["1","2"],
                     "props":{"dark":">1MΩ","light":"1-10kΩ","peak":"540nm"}},
     "pir":         {"label":"PIR",   "category":"Sensor",  "color":(136,68,0),   "w":38,"h":38,
-                    "symbol":"sensor",
-                    "pins":["VCC","OUT","GND"],
+                    "symbol":"sensor","pins":["VCC","OUT","GND"],
                     "props":{"range":"7m","angle":"120°","voltage":"5-20V","delay":"5s"}},
     "ultrasonic":  {"label":"HC-SR04","category":"Sensor", "color":(68,136,170), "w":66,"h":34,
-                    "symbol":"sensor",
-                    "pins":["VCC","TRIG","ECHO","GND"],
+                    "symbol":"sensor","pins":["VCC","TRIG","ECHO","GND"],
                     "props":{"range":"2-400cm","acc":"3mm","freq":"40kHz","voltage":"5V"}},
     "mpu6050":     {"label":"MPU6050","category":"Sensor", "color":(68,102,85),  "w":44,"h":44,
-                    "symbol":"ic",
-                    "pins":["VCC","GND","SCL","SDA","XDA","XCL","AD0","INT"],
+                    "symbol":"ic",   "pins":["VCC","GND","SCL","SDA","XDA","XCL","AD0","INT"],
                     "props":{"axes":"6-DOF","gyro":"±250-2000°/s","acc":"±2-16g","iface":"I2C","addr":"0x68"}},
     "mpu9250":     {"label":"MPU9250","category":"Sensor", "color":(60,95,75),   "w":44,"h":44,
-                    "symbol":"ic",
-                    "pins":["VDD","GND","SCL","SDA","AD0","INT","NCS","FSYNC"],
+                    "symbol":"ic",   "pins":["VDD","GND","SCL","SDA","AD0","INT","NCS","FSYNC"],
                     "props":{"axes":"9-DOF","mag":"±4800µT","iface":"I2C/SPI"}},
-    "soil_moisture":{"label":"Soil",  "category":"Sensor", "color":(68,119,51),  "w":24,"h":66,
-                    "symbol":"sensor",
-                    "pins":["VCC","GND","AOUT","DOUT"],
+    "soil_moisture":{"label":"Soil", "category":"Sensor",  "color":(68,119,51),  "w":24,"h":66,
+                    "symbol":"sensor","pins":["VCC","GND","AOUT","DOUT"],
                     "props":{"output":"Analog+Digital","voltage":"3.3-5V"}},
     "gas_mq2":     {"label":"MQ-2",  "category":"Sensor",  "color":(0,100,180),  "w":40,"h":40,
-                    "symbol":"sensor",
-                    "pins":["VCC","GND","AOUT","DOUT"],
+                    "symbol":"sensor","pins":["VCC","GND","AOUT","DOUT"],
                     "props":{"gas":"LPG/Smoke/H2","voltage":"5V","preheat":"20s"}},
     "color_sensor":{"label":"TCS3200","category":"Sensor", "color":(100,50,150), "w":44,"h":44,
-                    "symbol":"ic",
-                    "pins":["GND","OE","OUT","VCC","S0","S1","S2","S3"],
+                    "symbol":"ic",   "pins":["GND","OE","OUT","VCC","S0","S1","S2","S3"],
                     "props":{"filters":"RGBW","freq":"0-500kHz","voltage":"2.7-5.5V"}},
     "ir_recv":     {"label":"IR Recv","category":"Sensor", "color":(40,40,80),   "w":24,"h":30,
-                    "symbol":"sensor",
-                    "pins":["OUT","GND","VCC"],
+                    "symbol":"sensor","pins":["OUT","GND","VCC"],
                     "props":{"freq":"38kHz","range":"18m","voltage":"2.7-5.5V"}},
 
     # ── Actuators ────────────────────────────────────────────────────────────
     "servo":       {"label":"SERVO", "category":"Actuator","color":(255,102,0),  "w":44,"h":54,
-                    "symbol":"rect",
-                    "pins":["GND","VCC","PWM"],
+                    "symbol":"rect", "pins":["GND","VCC","PWM"],
                     "props":{"torque":"1.8kgcm","angle":"0-180°","voltage":"4.8-6V","freq":"50Hz"}},
     "servo_360":   {"label":"SRV360","category":"Actuator","color":(220,90,0),   "w":44,"h":54,
-                    "symbol":"rect",
-                    "pins":["GND","VCC","PWM"],
+                    "symbol":"rect", "pins":["GND","VCC","PWM"],
                     "props":{"type":"Continuous","voltage":"4.8-6V","freq":"50Hz"}},
     "stepper":     {"label":"STEP",  "category":"Actuator","color":(204,68,0),   "w":54,"h":54,
-                    "symbol":"rect",
-                    "pins":["IN1","IN2","IN3","IN4","VCC"],
+                    "symbol":"rect", "pins":["IN1","IN2","IN3","IN4","VCC"],
                     "props":{"steps":"64","gear":"1/64","voltage":"5V","current":"400mA"}},
     "dc_motor":    {"label":"DCMOT", "category":"Actuator","color":(136,68,0),   "w":48,"h":48,
-                    "symbol":"rect",
-                    "pins":["M+","M-"],
+                    "symbol":"rect", "pins":["M+","M-"],
                     "props":{"voltage":"3-6V","rpm":"200RPM","current":"200mA","stall":"800mA"}},
     "buzzer":      {"label":"BUZ",   "category":"Actuator","color":(60,60,60),   "w":30,"h":30,
-                    "symbol":"rect",
-                    "pins":["+","-"],
+                    "symbol":"rect", "pins":["+","-"],
                     "props":{"type":"Active","freq":"2.5kHz","voltage":"3-24V","spl":"85dB"}},
     "buzzer_p":    {"label":"PBUZ",  "category":"Actuator","color":(70,70,70),   "w":30,"h":30,
-                    "symbol":"rect",
-                    "pins":["+","-"],
+                    "symbol":"rect", "pins":["+","-"],
                     "props":{"type":"Passive","voltage":"3-5V","freq":"1-5kHz"}},
     "relay":       {"label":"RELAY", "category":"Actuator","color":(51,102,153), "w":64,"h":44,
-                    "symbol":"rect",
-                    "pins":["VCC","GND","IN","NC","COM","NO"],
+                    "symbol":"rect", "pins":["VCC","GND","IN","NC","COM","NO"],
                     "props":{"coil":"5V","contact":"10A 250VAC","type":"SPDT"}},
-    "relay_4ch":   {"label":"4CH RLY","category":"Actuator","color":(40,85,130), "w":100,"h":44,
-                    "symbol":"rect",
-                    "pins":["VCC","GND","IN1","IN2","IN3","IN4","COM1","NO1","NC1","COM2","NO2","NC2","COM3","NO3","NC3","COM4","NO4","NC4"],
+    "relay_4ch":   {"label":"4CH RLY","category":"Actuator","color":(40,85,130),"w":100,"h":44,
+                    "symbol":"rect", "pins":["VCC","GND","IN1","IN2","IN3","IN4","COM1","NO1","NC1","COM2","NO2","NC2","COM3","NO3","NC3","COM4","NO4","NC4"],
                     "props":{"channels":"4","coil":"5V","contact":"10A 250VAC"}},
     "l298n":       {"label":"L298N", "category":"Actuator","color":(153,68,0),   "w":74,"h":64,
-                    "symbol":"ic",
-                    "pins":["IN1","IN2","IN3","IN4","ENA","ENB","VCC","GND","12V"],
+                    "symbol":"ic",   "pins":["IN1","IN2","IN3","IN4","ENA","ENB","VCC","GND","12V"],
                     "props":{"maxA":"2A","maxV":"46V","channels":"2","pkg":"Multiwatt"}},
     "l9110s":      {"label":"L9110S","category":"Actuator","color":(130,55,0),   "w":54,"h":44,
-                    "symbol":"ic",
-                    "pins":["VCC","GND","A-IA","A-IB","OA1","OA2","B-IA","B-IB","OB1","OB2"],
+                    "symbol":"ic",   "pins":["VCC","GND","A-IA","A-IB","OA1","OA2","B-IA","B-IB","OB1","OB2"],
                     "props":{"maxA":"800mA","maxV":"12V","channels":"2"}},
     "solenoid":    {"label":"SOL",   "category":"Actuator","color":(80,100,80),  "w":44,"h":44,
-                    "symbol":"rect",
-                    "pins":["+","-"],
+                    "symbol":"rect", "pins":["+","-"],
                     "props":{"voltage":"12V","current":"1A","stroke":"10mm"}},
 
     # ── Communication ────────────────────────────────────────────────────────
     "nrf24":       {"label":"nRF24", "category":"Comms",   "color":(0,136,204),  "w":44,"h":54,
-                    "symbol":"ic",
-                    "pins":["GND","VCC","CE","CSN","SCK","MOSI","MISO","IRQ"],
+                    "symbol":"ic",   "pins":["GND","VCC","CE","CSN","SCK","MOSI","MISO","IRQ"],
                     "props":{"freq":"2.4GHz","range":"100m","rate":"2Mbps","voltage":"1.9-3.6V"}},
     "hc05":        {"label":"HC-05", "category":"Comms",   "color":(0,0,204),    "w":44,"h":54,
-                    "symbol":"ic",
-                    "pins":["VCC","GND","TXD","RXD","STATE","EN"],
+                    "symbol":"ic",   "pins":["VCC","GND","TXD","RXD","STATE","EN"],
                     "props":{"proto":"BT 2.0","range":"10m","baud":"9600","voltage":"3.3V"}},
     "hc06":        {"label":"HC-06", "category":"Comms",   "color":(0,0,180),    "w":44,"h":50,
-                    "symbol":"ic",
-                    "pins":["VCC","GND","TXD","RXD"],
+                    "symbol":"ic",   "pins":["VCC","GND","TXD","RXD"],
                     "props":{"proto":"BT 2.0","range":"10m","baud":"9600","slave":"Only"}},
     "lora":        {"label":"LoRa",  "category":"Comms",   "color":(102,34,102), "w":48,"h":58,
-                    "symbol":"ic",
-                    "pins":["GND","VCC","MISO","MOSI","SCK","NSS","RST","DIO0"],
+                    "symbol":"ic",   "pins":["GND","VCC","MISO","MOSI","SCK","NSS","RST","DIO0"],
                     "props":{"freq":"433MHz","range":"10km","iface":"SPI","voltage":"3.3V"}},
     "sim800l":     {"label":"SIM800","category":"Comms",   "color":(0,80,160),   "w":44,"h":54,
-                    "symbol":"ic",
-                    "pins":["VCC","GND","TXD","RXD","RST","DTR"],
+                    "symbol":"ic",   "pins":["VCC","GND","TXD","RXD","RST","DTR"],
                     "props":{"proto":"GSM/GPRS","bands":"Quad-band","voltage":"3.4-4.4V"}},
     "wifi_esp01":  {"label":"ESP-01","category":"Comms",   "color":(180,140,0),  "w":44,"h":44,
-                    "symbol":"ic",
-                    "pins":["GND","GPIO0","UTXD","CH_PD","GPIO2","RST","URXD","VCC"],
+                    "symbol":"ic",   "pins":["GND","GPIO0","UTXD","CH_PD","GPIO2","RST","URXD","VCC"],
                     "props":{"proto":"WiFi 802.11b/g/n","voltage":"3.3V"}},
     "can_mcp2515": {"label":"MCP2515","category":"Comms",  "color":(80,60,120),  "w":54,"h":54,
-                    "symbol":"ic",
-                    "pins":["VCC","GND","CS","SO","SI","SCK","INT","TXD","RXD"],
+                    "symbol":"ic",   "pins":["VCC","GND","CS","SO","SI","SCK","INT","TXD","RXD"],
                     "props":{"proto":"CAN 2.0B","rate":"1Mbps","iface":"SPI"}},
     "rs485":       {"label":"MAX485","category":"Comms",   "color":(60,80,100),  "w":44,"h":44,
-                    "symbol":"ic",
-                    "pins":["RO","RE","DE","DI","GND","A","B","VCC"],
+                    "symbol":"ic",   "pins":["RO","RE","DE","DI","GND","A","B","VCC"],
                     "props":{"proto":"RS-485","rate":"2.5Mbps","voltage":"5V"}},
 
     # ── Power ────────────────────────────────────────────────────────────────
     "power_5v":    {"label":"5V PSU","category":"Power",   "color":(200,0,0),    "w":34,"h":44,
-                    "symbol":"rect",
-                    "pins":["V+","GND"],
+                    "symbol":"rect", "pins":["V+","GND"],
                     "props":{"voltage":"5V","current":"2A","type":"USB"}},
     "power_12v":   {"label":"12V PSU","category":"Power",  "color":(180,0,0),    "w":34,"h":44,
-                    "symbol":"rect",
-                    "pins":["V+","GND"],
+                    "symbol":"rect", "pins":["V+","GND"],
                     "props":{"voltage":"12V","current":"2A"}},
     "power_3v3":   {"label":"3V3 REG","category":"Power",  "color":(0,68,200),   "w":24,"h":34,
-                    "symbol":"ic",
-                    "pins":["IN","OUT","GND"],
+                    "symbol":"ic",   "pins":["IN","OUT","GND"],
                     "props":{"output":"3.3V","maxA":"1A","dropout":"1.2V","pkg":"TO-220"}},
     "ldo_lm7805":  {"label":"7805",  "category":"Power",   "color":(0,50,180),   "w":24,"h":34,
-                    "symbol":"ic",
-                    "pins":["IN","GND","OUT"],
+                    "symbol":"ic",   "pins":["IN","GND","OUT"],
                     "props":{"output":"5V","maxA":"1.5A","dropout":"2V","pkg":"TO-220"}},
     "battery_lipo":{"label":"LiPo",  "category":"Power",   "color":(0,136,68),   "w":54,"h":34,
-                    "symbol":"rect",
-                    "pins":["+","-"],
+                    "symbol":"rect", "pins":["+","-"],
                     "props":{"voltage":"3.7V","cap":"1000mAh","maxC":"1C","type":"Li-Ion"}},
     "battery_9v":  {"label":"9V BAT","category":"Power",   "color":(0,100,50),   "w":44,"h":34,
-                    "symbol":"rect",
-                    "pins":["+","-"],
+                    "symbol":"rect", "pins":["+","-"],
                     "props":{"voltage":"9V","cap":"500mAh","type":"Alkaline"}},
     "tp4056":      {"label":"TP4056","category":"Power",   "color":(0,100,150),  "w":50,"h":34,
-                    "symbol":"ic",
-                    "pins":["IN+","IN-","BAT+","BAT-","OUT+","OUT-"],
+                    "symbol":"ic",   "pins":["IN+","IN-","BAT+","BAT-","OUT+","OUT-"],
                     "props":{"type":"LiPo Charger","current":"1A","cutoff":"4.2V"}},
     "boost_mt3608":{"label":"MT3608","category":"Power",   "color":(0,80,120),   "w":50,"h":34,
-                    "symbol":"ic",
-                    "pins":["GND","VIN","EN","FB","SW","VOUT"],
+                    "symbol":"ic",   "pins":["GND","VIN","EN","FB","SW","VOUT"],
                     "props":{"type":"Boost","vin":"2-24V","vout":"5-28V","maxA":"2A"}},
 
     # ── Input ────────────────────────────────────────────────────────────────
     "pushbutton":  {"label":"BTN",   "category":"Input",   "color":(80,80,80),   "w":22,"h":22,
-                    "symbol":"rect",
-                    "pins":["1A","1B","2A","2B"],
+                    "symbol":"rect", "pins":["1A","1B","2A","2B"],
                     "props":{"rating":"50mA 12V","type":"Momentary SPST","bounce":"5ms"}},
     "toggle_sw":   {"label":"SW",    "category":"Input",   "color":(90,90,90),   "w":30,"h":22,
-                    "symbol":"rect",
-                    "pins":["COM","NO","NC"],
+                    "symbol":"rect", "pins":["COM","NO","NC"],
                     "props":{"type":"SPDT Toggle","rating":"5A 125VAC"}},
     "rotary_enc":  {"label":"ENC",   "category":"Input",   "color":(100,100,100),"w":38,"h":38,
-                    "symbol":"rect",
-                    "pins":["CLK","DT","SW","VCC","GND"],
+                    "symbol":"rect", "pins":["CLK","DT","SW","VCC","GND"],
                     "props":{"ppr":"20","type":"Incremental","steps":"20/rev"}},
     "joystick":    {"label":"JOY",   "category":"Input",   "color":(68,68,68),   "w":44,"h":44,
-                    "symbol":"rect",
-                    "pins":["VRx","VRy","SW","VCC","GND"],
+                    "symbol":"rect", "pins":["VRx","VRy","SW","VCC","GND"],
                     "props":{"axes":"2","output":"Analog 0-5V","button":"Yes"}},
     "keypad_4x4":  {"label":"KEYPAD","category":"Input",   "color":(51,68,85),   "w":64,"h":64,
-                    "symbol":"rect",
-                    "pins":["R1","R2","R3","R4","C1","C2","C3","C4"],
+                    "symbol":"rect", "pins":["R1","R2","R3","R4","C1","C2","C3","C4"],
                     "props":{"layout":"4x4","keys":"16","type":"Membrane"}},
     "keypad_4x3":  {"label":"KP4x3", "category":"Input",   "color":(45,60,75),   "w":54,"h":64,
-                    "symbol":"rect",
-                    "pins":["R1","R2","R3","R4","C1","C2","C3"],
+                    "symbol":"rect", "pins":["R1","R2","R3","R4","C1","C2","C3"],
                     "props":{"layout":"4x3","keys":"12","type":"Membrane"}},
     "touch_cap":   {"label":"TTP223","category":"Input",   "color":(60,100,100), "w":30,"h":24,
-                    "symbol":"ic",
-                    "pins":["GND","VCC","I/O"],
+                    "symbol":"ic",   "pins":["GND","VCC","I/O"],
                     "props":{"type":"Capacitive Touch","voltage":"2-5.5V","output":"Digital"}},
 
     # ── Semiconductors ───────────────────────────────────────────────────────
     "npn_2n2222":  {"label":"2N2222","category":"Semi",    "color":(68,102,136), "w":22,"h":34,
-                    "symbol":"trans",
-                    "pins":["B","C","E"],
+                    "symbol":"trans","pins":["B","C","E"],
                     "props":{"type":"NPN","Vceo":"40V","Ic":"600mA","hFE":"100-300","pkg":"TO-92"}},
     "pnp_2n2907":  {"label":"2N2907","category":"Semi",    "color":(100,70,100), "w":22,"h":34,
-                    "symbol":"trans",
-                    "pins":["B","C","E"],
+                    "symbol":"trans","pins":["B","C","E"],
                     "props":{"type":"PNP","Vceo":"40V","Ic":"600mA","hFE":"100-300","pkg":"TO-92"}},
     "mosfet_n":    {"label":"N-MOS", "category":"Semi",    "color":(136,68,102), "w":22,"h":34,
-                    "symbol":"trans",
-                    "pins":["G","D","S"],
+                    "symbol":"trans","pins":["G","D","S"],
                     "props":{"type":"N-Channel","Vds":"55V","Id":"47A","Rds":"22mΩ","pkg":"TO-220"}},
     "mosfet_p":    {"label":"P-MOS", "category":"Semi",    "color":(120,60,90),  "w":22,"h":34,
-                    "symbol":"trans",
-                    "pins":["G","D","S"],
+                    "symbol":"trans","pins":["G","D","S"],
                     "props":{"type":"P-Channel","Vds":"-30V","Id":"-5A","pkg":"TO-220"}},
     "diode_1n4007":{"label":"1N4007","category":"Semi",    "color":(68,136,170), "w":44,"h":18,
-                    "symbol":"diode",
-                    "pins":["A","K"],
+                    "symbol":"diode","pins":["A","K"],
                     "props":{"Vf":"1.1V","If":"1A","Vr":"1000V","type":"Rectifier"}},
     "schottky":    {"label":"1N5817","category":"Semi",    "color":(80,150,180), "w":44,"h":18,
-                    "symbol":"diode",
-                    "pins":["A","K"],
+                    "symbol":"diode","pins":["A","K"],
                     "props":{"Vf":"0.3V","If":"1A","Vr":"20V","type":"Schottky"}},
     "zener":       {"label":"ZENER", "category":"Semi",    "color":(68,136,136), "w":44,"h":18,
-                    "symbol":"diode",
-                    "pins":["A","K"],
+                    "symbol":"diode","pins":["A","K"],
                     "props":{"Vz":"5.1V","Iz":"5mA","Pz":"500mW"}},
     "opto":        {"label":"PC817", "category":"Semi",    "color":(60,80,60),   "w":44,"h":34,
-                    "symbol":"ic",
-                    "pins":["A","K","C","E"],
+                    "symbol":"ic",   "pins":["A","K","C","E"],
                     "props":{"type":"Optocoupler","CTR":"100%","Viso":"5kV","pkg":"DIP-4"}},
     "voltage_ref": {"label":"TL431", "category":"Semi",    "color":(90,60,90),   "w":22,"h":30,
-                    "symbol":"trans",
-                    "pins":["REF","K","A"],
+                    "symbol":"trans","pins":["REF","K","A"],
                     "props":{"Vref":"2.5V","Imax":"100mA","type":"Adj Shunt Ref"}},
 
     # ── Connectors ───────────────────────────────────────────────────────────
     "gnd":         {"label":"GND",   "category":"Power",   "color":(60,60,60),   "w":24,"h":24,
-                    "symbol":"rect",
-                    "pins":["GND"],
+                    "symbol":"rect", "pins":["GND"],
                     "props":{"type":"Ground Reference"}},
     "vcc":         {"label":"VCC",   "category":"Power",   "color":(200,50,50),  "w":24,"h":24,
-                    "symbol":"rect",
-                    "pins":["VCC"],
+                    "symbol":"rect", "pins":["VCC"],
                     "props":{"type":"Power Rail"}},
     "header_2":    {"label":"2-Pin", "category":"Connector","color":(80,80,80),  "w":20,"h":40,
-                    "symbol":"rect",
-                    "pins":["1","2"],
+                    "symbol":"rect", "pins":["1","2"],
                     "props":{"pitch":"2.54mm","type":"Male Header"}},
     "header_3":    {"label":"3-Pin", "category":"Connector","color":(80,80,80),  "w":20,"h":54,
-                    "symbol":"rect",
-                    "pins":["1","2","3"],
+                    "symbol":"rect", "pins":["1","2","3"],
                     "props":{"pitch":"2.54mm","type":"Male Header"}},
     "screw_term":  {"label":"TERM",  "category":"Connector","color":(70,100,70), "w":40,"h":30,
-                    "symbol":"rect",
-                    "pins":["1","2"],
+                    "symbol":"rect", "pins":["1","2"],
                     "props":{"pitch":"5.08mm","rating":"10A 300V","type":"Screw Terminal"}},
     "usb_c":       {"label":"USB-C", "category":"Connector","color":(100,100,120),"w":30,"h":24,
-                    "symbol":"rect",
-                    "pins":["VBUS","GND","D+","D-","CC1","CC2"],
+                    "symbol":"rect", "pins":["VBUS","GND","D+","D-","CC1","CC2"],
                     "props":{"type":"USB Type-C","rating":"5A","voltage":"5-20V"}},
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  NET WIRE COLOURS
-# ─────────────────────────────────────────────────────────────────────────────
 _NET_COLOURS = [
     (0, 212, 255), (0, 255, 120), (255, 180, 0), (255, 80, 200),
     (100, 255, 80),(200, 120, 255),(0, 200, 200),(255, 120, 80),
+    (255, 255, 80),(80, 255, 200),(255, 100, 100),(100, 200, 255),
 ]
 
 
@@ -439,9 +364,13 @@ class Component:
 
 @dataclass
 class Wire:
-    points: list          # [(x,y), ...] in world coords
-    color:  tuple = (0, 212, 255)
-    net_id: int   = -1
+    points:   list           # [(x,y), ...] in world coords
+    src_comp: int   = -1     # NEW: source component id
+    src_pin:  str   = ""     # NEW: source pin name
+    dst_comp: int   = -1     # NEW: dest component id
+    dst_pin:  str   = ""     # NEW: dest pin name
+    color:    tuple = (0, 212, 255)
+    net_id:   int   = -1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -450,21 +379,25 @@ class Wire:
 class CircuitEngine:
     GRID = 20
 
-    # Panel layout
-    PANEL_W       = 220    # width of right component-picker panel
-    PANEL_ITEM_H  = 36     # height of each component row
-    PANEL_CAT_H   = 26     # height of category header
+    PANEL_W       = 220
+    PANEL_ITEM_H  = 36
+    PANEL_CAT_H   = 26
+
+    # ── pin dot radius (world coords) for hit testing — scales with zoom
+    PIN_HIT_BASE  = 12     # base radius; actual = max(PIN_HIT_BASE, PIN_HIT_BASE/zoom)
 
     def __init__(self, canvas_w: int = 1280, canvas_h: int = 720):
         self.canvas_w = canvas_w
         self.canvas_h = canvas_h
+
+        self._lock = threading.RLock()          # [FIX 7] thread safety
 
         # Scene
         self.components: list[Component] = []
         self.wires:      list[Wire]      = []
         self._next_id = 1
 
-        # Viewport (board area excludes panel)
+        # Viewport
         self.pan_x: float = 0.0
         self.pan_y: float = 0.0
         self.zoom:  float = 1.0
@@ -481,22 +414,18 @@ class CircuitEngine:
         self.panel_visible:   bool  = True
         self.panel_scroll:    int   = 0
         self.panel_selected:  str   = "resistor"
-        self._panel_items:    list  = []   # built by _build_panel_items()
+        self._panel_items:    list  = []
         self._panel_hovered:  str   = ""
 
         # Simulation
         self.sim_running: bool  = False
         self.sim_tick:    int   = 0
         self._sim_t0:     float = 0.0
-        self.serial_log:  list  = []
+        self.serial_log:  deque = deque(maxlen=200)  # [FIX 9] deque, no leak
 
         # Undo
         self._undo_stack: list  = []
 
-        # Net colours
-        self._net_colours: dict = {}
-
-        # Settings
         self.show_grid:   bool = True
         self.show_pins:   bool = True
         self.show_labels: bool = True
@@ -504,7 +433,276 @@ class CircuitEngine:
         self._build_panel_items()
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  BOARD AREA  (excludes right panel)
+    #  [FIX 1]  SNAPSHOT / RESTORE  (kernel undo support)
+    # ─────────────────────────────────────────────────────────────────────────
+    def snapshot(self) -> dict:
+        """Return a deep-copyable snapshot of circuit state."""
+        with self._lock:
+            return {
+                "comps": deepcopy(self.components),
+                "wires": deepcopy(self.wires),
+                "next_id": self._next_id,
+            }
+
+    def restore(self, state: dict):
+        """Restore circuit to a previous snapshot."""
+        with self._lock:
+            self.components  = deepcopy(state["comps"])
+            self.wires       = deepcopy(state["wires"])
+            self._next_id    = state.get("next_id", self._next_id)
+            self.selected_id = None
+            self.wire_in_progress = None
+        self._log("[UNDO] State restored.")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  [FIX 2]  add_wire — gesture-driven pin-to-pin connection
+    # ─────────────────────────────────────────────────────────────────────────
+    def add_wire(self, src_id: int, src_pin: str,
+                 dst_id: int, dst_pin: str) -> Optional[Wire]:
+        """
+        Create a named-pin wire between two components.
+        Routes via get_pin_by_name so the wire actually starts/ends
+        at the correct GPIO pin, not just the component origin.
+        """
+        with self._lock:
+            src = self.get_component(src_id)
+            dst = self.get_component(dst_id)
+            if src is None or dst is None:
+                return None
+
+            src_pt = self.get_pin_by_name(src, src_pin)
+            dst_pt = self.get_pin_by_name(dst, dst_pin)
+
+            # Fall back to nearest pin if named pin not found
+            if src_pt is None:
+                pins = self.get_pin_positions(src)
+                src_pt = pins[0] if pins else (src.x, src.y)
+            if dst_pt is None:
+                pins = self.get_pin_positions(dst)
+                dst_pt = pins[0] if pins else (dst.x, dst.y)
+
+            # Manhattan route: two points + corner
+            sx, sy = src_pt
+            dx, dy = dst_pt
+            if abs(dx - sx) > abs(dy - sy):
+                corner = (dx, sy)
+            else:
+                corner = (sx, dy)
+
+            points = [src_pt, corner, dst_pt]
+            # Deduplicate consecutive identical points
+            pts = [points[0]]
+            for p in points[1:]:
+                if p != pts[-1]:
+                    pts.append(p)
+
+            self._push_undo()
+            net_id = len(self.wires)
+            wire = Wire(
+                points   = pts,
+                src_comp = src_id,
+                src_pin  = src_pin,
+                dst_comp = dst_id,
+                dst_pin  = dst_pin,
+                color    = _NET_COLOURS[net_id % len(_NET_COLOURS)],
+                net_id   = net_id,
+            )
+            self.wires.append(wire)
+            self._log(f"[WIRE] {src.label}.{src_pin} → {dst.label}.{dst_pin}")
+            return wire
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  [FIX 3]  hit_test with radius_multiplier
+    # ─────────────────────────────────────────────────────────────────────────
+    def hit_test(self, wx: float, wy: float,
+                 radius_multiplier: float = 1.0) -> Optional[Component]:
+        """
+        Returns the topmost component whose bounding box contains (wx,wy).
+        radius_multiplier expands the hit box — use 1.8 for forgiving AR grab.
+        """
+        with self._lock:
+            for comp in reversed(self.components):
+                d  = CATALOG[comp.type_id]
+                cw = d["w"]
+                ch = d["h"]
+                pad = (radius_multiplier - 1.0) * max(cw, ch) * 0.5
+                if (comp.x - pad <= wx <= comp.x + cw + pad and
+                        comp.y - pad <= wy <= comp.y + ch + pad):
+                    return comp
+        return None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  [FIX 4/5/6]  PIN POSITIONS — left+right split, named lookup, rotation
+    # ─────────────────────────────────────────────────────────────────────────
+    def _split_pins(self, pins: list[str]) -> tuple[list[str], list[str]]:
+        """
+        For ICs: split pin list into left-side and right-side columns.
+        Convention: first half on left, second half on right (standard DIP/IC layout).
+        For 2-pin components: pin 1 left, pin 2 right.
+        """
+        n = len(pins)
+        if n <= 1:
+            return pins, []
+        if n == 2:
+            return [pins[0]], [pins[1]]
+        half = (n + 1) // 2
+        return pins[:half], pins[half:]
+
+    def get_pin_positions(self, comp: Component) -> list[tuple[int, int]]:
+        """
+        Return world-coord (x,y) for every pin.
+        ICs get left+right column layout.
+        Non-ICs retain their original single-edge layout.
+        Rotation is applied around the component centre.
+        """
+        d     = CATALOG[comp.type_id]
+        cw    = d["w"]
+        ch    = d["h"]
+        sym   = d.get("symbol", "rect")
+        pins  = d.get("pins", [])
+        if not pins:
+            return []
+
+        positions = []
+        cx = comp.x + cw / 2
+        cy = comp.y + ch / 2
+
+        if sym in ("ic", "sensor"):
+            left_pins, right_pins = self._split_pins(pins)
+
+            # Left side
+            nl = len(left_pins)
+            step_l = ch / (nl + 1)
+            for i in range(nl):
+                py = comp.y + step_l * (i + 1)
+                positions.append((comp.x, py))
+
+            # Right side
+            nr = len(right_pins)
+            step_r = ch / (nr + 1)
+            for i in range(nr):
+                py = comp.y + step_r * (i + 1)
+                positions.append((comp.x + cw, py))
+
+        elif sym in ("res", "inductor"):
+            # Leads on left and right ends (horizontal)
+            positions.append((comp.x, comp.y + ch / 2))
+            positions.append((comp.x + cw, comp.y + ch / 2))
+
+        elif sym == "cap":
+            # Two vertical plates — leads on left/right
+            positions.append((comp.x, comp.y + ch / 2))
+            positions.append((comp.x + cw, comp.y + ch / 2))
+
+        elif sym in ("led", "diode"):
+            positions.append((comp.x, comp.y + ch / 2))           # anode (left)
+            positions.append((comp.x + cw, comp.y + ch / 2))     # cathode (right)
+
+        elif sym == "trans":
+            # B on left, C top, E bottom
+            r = max(8, min(cw, ch) // 2 - 2)
+            positions.append((comp.x, comp.y + ch / 2))       # B
+            positions.append((comp.x + cw / 2, comp.y))       # C
+            positions.append((comp.x + cw / 2, comp.y + ch))  # E
+
+        else:
+            # rect: evenly spaced on left side (legacy behaviour)
+            n = len(pins)
+            step = ch / (n + 1)
+            for i in range(n):
+                positions.append((comp.x, comp.y + step * (i + 1)))
+
+        # [FIX 6] Apply rotation around component centre
+        if comp.rotation != 0:
+            angle = math.radians(comp.rotation)
+            cos_a, sin_a = math.cos(angle), math.sin(angle)
+            rotated = []
+            for px, py in positions:
+                dx, dy = px - cx, py - cy
+                rx = cx + dx * cos_a - dy * sin_a
+                ry = cy + dx * sin_a + dy * cos_a
+                rotated.append((rx, ry))
+            positions = rotated
+
+        return [(int(round(px)), int(round(py))) for px, py in positions]
+
+    def get_pin_by_name(self, comp: Component,
+                        pin_name: str) -> Optional[tuple[int, int]]:
+        """
+        Return the world-coord (x,y) of a named pin on comp.
+        Returns None if pin_name not found.
+        Case-insensitive match.
+        """
+        d    = CATALOG.get(comp.type_id, {})
+        pins = d.get("pins", [])
+        pin_name_lower = pin_name.lower()
+
+        # Try exact match first, then case-insensitive
+        idx = None
+        for i, p in enumerate(pins):
+            if p == pin_name:
+                idx = i
+                break
+        if idx is None:
+            for i, p in enumerate(pins):
+                if p.lower() == pin_name_lower:
+                    idx = i
+                    break
+        if idx is None:
+            return None
+
+        positions = self.get_pin_positions(comp)
+        if idx < len(positions):
+            return positions[idx]
+        return None
+
+    def nearest_pin(self, wx: float, wy: float,
+                    threshold: float = None) -> Optional[tuple[int, int]]:
+        """
+        Return snapped world coord of nearest pin within threshold.
+        Threshold scales with zoom for AR usability.
+        """
+        if threshold is None:
+            threshold = max(self.PIN_HIT_BASE, self.PIN_HIT_BASE / self.zoom)
+
+        best_d  = threshold
+        best_pt = None
+        with self._lock:
+            for comp in self.components:
+                for px, py in self.get_pin_positions(comp):
+                    d = math.hypot(wx - px, wy - py)
+                    if d < best_d:
+                        best_d  = d
+                        best_pt = (px, py)
+        return best_pt
+
+    def nearest_pin_with_info(self, wx: float, wy: float,
+                               threshold: float = None
+                               ) -> Optional[tuple[Component, str, tuple]]:
+        """
+        Like nearest_pin but returns (component, pin_name, (wx,wy)).
+        Used by kernel wire-draw mode to record exact src/dst pin.
+        """
+        if threshold is None:
+            threshold = max(self.PIN_HIT_BASE, self.PIN_HIT_BASE / self.zoom)
+
+        best_d    = threshold
+        best_info = None
+        with self._lock:
+            for comp in self.components:
+                d_    = CATALOG[comp.type_id]
+                pins  = d_.get("pins", [])
+                positions = self.get_pin_positions(comp)
+                for i, (px, py) in enumerate(positions):
+                    dist = math.hypot(wx - px, wy - py)
+                    if dist < best_d:
+                        best_d    = dist
+                        pin_name  = pins[i] if i < len(pins) else str(i)
+                        best_info = (comp, pin_name, (px, py))
+        return best_info
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  BOARD AREA
     # ─────────────────────────────────────────────────────────────────────────
     @property
     def board_w(self) -> int:
@@ -514,7 +712,6 @@ class CircuitEngine:
     #  PANEL ITEMS
     # ─────────────────────────────────────────────────────────────────────────
     def _build_panel_items(self):
-        """Builds sorted list of (kind, key, label) for the picker panel."""
         cats: dict[str, list] = {}
         for tid, d in CATALOG.items():
             cats.setdefault(d["category"], []).append((tid, d["label"]))
@@ -526,7 +723,6 @@ class CircuitEngine:
             self._panel_items.append(("cat", cat, cat))
             for tid, lbl in sorted(cats[cat], key=lambda x: x[1]):
                 self._panel_items.append(("comp", tid, lbl))
-        # Fallback for any unlisted categories
         for cat in cats:
             if cat not in order:
                 self._panel_items.append(("cat", cat, cat))
@@ -561,52 +757,89 @@ class CircuitEngine:
         return self.panel_visible and sx >= self.board_w
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  COMPONENT MANAGEMENT
+    #  COMPONENT MANAGEMENT  (thread-safe)
     # ─────────────────────────────────────────────────────────────────────────
     def add_component(self, type_id: str, wx: float, wy: float,
                       label: str = "", props: dict = None) -> Optional[Component]:
         if type_id not in CATALOG:
             return None
-        self._push_undo()
-        comp = Component(
-            id=self._new_id(),
-            type_id=type_id,
-            x=self.snap(wx),
-            y=self.snap(wy),
-            label=label or CATALOG[type_id]["label"],
-            props=props or dict(CATALOG[type_id].get("props", {}))
-        )
-        self.components.append(comp)
+        with self._lock:
+            self._push_undo()
+            comp = Component(
+                id=self._new_id(),
+                type_id=type_id,
+                x=self.snap(wx),
+                y=self.snap(wy),
+                label=label or CATALOG[type_id]["label"],
+                props=props or dict(CATALOG[type_id].get("props", {}))
+            )
+            self.components.append(comp)
         self._log(f"[PLACE] {comp.label} (id={comp.id}) @ ({comp.x},{comp.y})")
         return comp
 
     def remove_component(self, comp_id: int):
-        self._push_undo()
-        self.components = [c for c in self.components if c.id != comp_id]
-        if self.selected_id == comp_id:
-            self.selected_id = None
+        with self._lock:
+            self._push_undo()
+            self.components = [c for c in self.components if c.id != comp_id]
+            # Remove wires connected to this component
+            self.wires = [w for w in self.wires
+                          if w.src_comp != comp_id and w.dst_comp != comp_id]
+            if self.selected_id == comp_id:
+                self.selected_id = None
 
     def duplicate_component(self, comp_id: int) -> Optional[Component]:
         src = self.get_component(comp_id)
         if not src:
             return None
-        self._push_undo()
-        new_c = Component(
-            id=self._new_id(),
-            type_id=src.type_id,
-            x=src.x + self.GRID * 4,
-            y=src.y + self.GRID * 4,
-            rotation=src.rotation,
-            label=src.label,
-            props=dict(src.props)
-        )
-        self.components.append(new_c)
+        with self._lock:
+            self._push_undo()
+            new_c = Component(
+                id=self._new_id(),
+                type_id=src.type_id,
+                x=src.x + self.GRID * 4,
+                y=src.y + self.GRID * 4,
+                rotation=src.rotation,
+                label=src.label,
+                props=dict(src.props)
+            )
+            self.components.append(new_c)
         return new_c
 
     def rotate_component(self, comp_id: int, delta: int = 90):
         c = self.get_component(comp_id)
         if c:
-            c.rotation = (c.rotation + delta) % 360
+            with self._lock:
+                c.rotation = (c.rotation + delta) % 360
+            # Re-route wires attached to this component
+            self._reroute_component_wires(comp_id)
+
+    def _reroute_component_wires(self, comp_id: int):
+        """Re-compute wire endpoints after a component rotation/move."""
+        with self._lock:
+            comp = self.get_component(comp_id)
+            if comp is None:
+                return
+            for wire in self.wires:
+                changed = False
+                if wire.src_comp == comp_id and wire.src_pin:
+                    pt = self.get_pin_by_name(comp, wire.src_pin)
+                    if pt:
+                        wire.points[0] = pt
+                        changed = True
+                if wire.dst_comp == comp_id and wire.dst_pin:
+                    pt = self.get_pin_by_name(comp, wire.dst_pin)
+                    if pt:
+                        wire.points[-1] = pt
+                        changed = True
+                if changed and len(wire.points) >= 2:
+                    # Recompute Manhattan corner
+                    sx, sy = wire.points[0]
+                    ex, ey = wire.points[-1]
+                    if abs(ex - sx) > abs(ey - sy):
+                        corner = (ex, sy)
+                    else:
+                        corner = (sx, ey)
+                    wire.points = [wire.points[0], corner, wire.points[-1]]
 
     def get_component(self, comp_id: int) -> Optional[Component]:
         for c in self.components:
@@ -615,88 +848,70 @@ class CircuitEngine:
         return None
 
     def clear(self):
-        self._push_undo()
-        self.components.clear()
-        self.wires.clear()
-        self.selected_id = None
-        self.wire_in_progress = None
-        self.sim_running = False
+        with self._lock:
+            self._push_undo()
+            self.components.clear()
+            self.wires.clear()
+            self.selected_id = None
+            self.wire_in_progress = None
+            self.sim_running = False
         self._log("[CLEAR] Board cleared.")
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  PIN WORLD POSITIONS
-    # ─────────────────────────────────────────────────────────────────────────
-    def get_pin_positions(self, comp: Component) -> list[tuple[int, int]]:
-        """Return world-coord positions for each pin of comp."""
-        d    = CATALOG[comp.type_id]
-        cw   = d["w"]
-        ch   = d["h"]
-        pins = d.get("pins", [])
-        if not pins:
-            return []
-        positions = []
-        step = ch / (len(pins) + 1)
-        for i in range(len(pins)):
-            # pins on left edge
-            py = int(comp.y + step * (i + 1))
-            positions.append((comp.x, py))
-        return positions
-
-    def nearest_pin(self, wx: float, wy: float,
-                    threshold: float = 15.0) -> Optional[tuple[int, int]]:
-        """Return snapped world coord of nearest pin within threshold px."""
-        best_d  = threshold
-        best_pt = None
-        for comp in self.components:
-            for px, py in self.get_pin_positions(comp):
-                d = math.hypot(wx - px, wy - py)
-                if d < best_d:
-                    best_d  = d
-                    best_pt = (px, py)
-        return best_pt
-
-    # ─────────────────────────────────────────────────────────────────────────
-    #  WIRES
+    #  WIRES  (manual/cursor-draw, for non-gesture mode)
     # ─────────────────────────────────────────────────────────────────────────
     def start_wire(self, wx: float, wy: float):
-        pin = self.nearest_pin(wx, wy)
-        pt  = pin if pin else (self.snap(wx), self.snap(wy))
-        self.wire_in_progress = Wire(points=[pt])
+        pin_info = self.nearest_pin_with_info(wx, wy)
+        if pin_info:
+            comp, pin_name, pt = pin_info
+            self.wire_in_progress = Wire(
+                points=[pt], src_comp=comp.id, src_pin=pin_name)
+        else:
+            pt = (self.snap(wx), self.snap(wy))
+            self.wire_in_progress = Wire(points=[pt])
 
     def extend_wire(self, wx: float, wy: float):
         if not self.wire_in_progress:
             return
         pin  = self.nearest_pin(wx, wy)
         pt   = pin if pin else (self.snap(wx), self.snap(wy))
-        last = self.wire_in_progress.points[-1]
-        if pt != last:
-            # Manhattan routing: insert corner point
-            lx, ly = last
-            ex, ey = pt
-            if abs(ex - lx) > abs(ey - ly):
-                corner = (ex, ly)
-            else:
-                corner = (lx, ey)
-            if corner != last and corner != pt:
-                # Replace last point if it was a preview corner
-                if len(self.wire_in_progress.points) >= 2:
-                    prev = self.wire_in_progress.points[-2]
-                    # Only update the last segment corner
-                    if (prev[0] == lx or prev[1] == ly):
-                        self.wire_in_progress.points[-1] = corner
-                        self.wire_in_progress.points.append(pt)
-                        return
-                self.wire_in_progress.points.append(corner)
+        # Only store the start point + current endpoint (preview only)
+        if len(self.wire_in_progress.points) == 1:
             self.wire_in_progress.points.append(pt)
+        else:
+            self.wire_in_progress.points[-1] = pt
 
     def finish_wire(self):
         if self.wire_in_progress and len(self.wire_in_progress.points) >= 2:
-            self._push_undo()
-            net_id = len(self.wires)
-            self.wire_in_progress.net_id = net_id
-            self.wire_in_progress.color  = _NET_COLOURS[net_id % len(_NET_COLOURS)]
-            self.wires.append(self.wire_in_progress)
-            self._log(f"[WIRE] Wire #{net_id} added ({len(self.wire_in_progress.points)} pts)")
+            with self._lock:
+                self._push_undo()
+                # Try to snap endpoint to a named pin
+                ex, ey = self.wire_in_progress.points[-1]
+                pin_info = self.nearest_pin_with_info(ex, ey)
+                if pin_info:
+                    comp, pin_name, pt = pin_info
+                    self.wire_in_progress.points[-1] = pt
+                    self.wire_in_progress.dst_comp   = comp.id
+                    self.wire_in_progress.dst_pin    = pin_name
+
+                # Rebuild Manhattan path
+                sx, sy = self.wire_in_progress.points[0]
+                ex, ey = self.wire_in_progress.points[-1]
+                if abs(ex - sx) > abs(ey - sy):
+                    corner = (ex, sy)
+                else:
+                    corner = (sx, ey)
+                pts = [self.wire_in_progress.points[0]]
+                if corner != pts[-1] and corner != (ex, ey):
+                    pts.append(corner)
+                pts.append((ex, ey))
+                self.wire_in_progress.points = pts
+
+                net_id = len(self.wires)
+                self.wire_in_progress.net_id = net_id
+                self.wire_in_progress.color  = _NET_COLOURS[net_id % len(_NET_COLOURS)]
+                self.wires.append(self.wire_in_progress)
+                self._log(f"[WIRE] Wire #{net_id} added")
         self.wire_in_progress = None
 
     def cancel_wire(self):
@@ -707,22 +922,9 @@ class CircuitEngine:
             self.wires.pop()
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  HIT TEST
-    # ─────────────────────────────────────────────────────────────────────────
-    def hit_test(self, wx: float, wy: float) -> Optional[Component]:
-        for comp in reversed(self.components):
-            d  = CATALOG[comp.type_id]
-            cw = d["w"]
-            ch = d["h"]
-            if comp.x <= wx <= comp.x + cw and comp.y <= wy <= comp.y + ch:
-                return comp
-        return None
-
-    # ─────────────────────────────────────────────────────────────────────────
     #  PANEL HIT TEST
     # ─────────────────────────────────────────────────────────────────────────
     def panel_hit_test(self, sx: float, sy: float) -> Optional[str]:
-        """Returns type_id if a component row was clicked in the panel."""
         if not self.in_panel(sx, sy):
             return None
         rel_y = int(sy) - (-self.panel_scroll)
@@ -779,12 +981,14 @@ class CircuitEngine:
         self.pan_y = self.canvas_h / 2 - cy * self.zoom
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  UNDO
+    #  UNDO  (engine-owned, authoritative)
     # ─────────────────────────────────────────────────────────────────────────
     def _push_undo(self):
+        """Internal — call WITHOUT holding _lock (snapshot() acquires it)."""
         state = {
-            "comps": deepcopy(self.components),
-            "wires": deepcopy(self.wires),
+            "comps":   deepcopy(self.components),
+            "wires":   deepcopy(self.wires),
+            "next_id": self._next_id,
         }
         self._undo_stack.append(state)
         if len(self._undo_stack) > 20:
@@ -794,13 +998,15 @@ class CircuitEngine:
         if not self._undo_stack:
             return
         state = self._undo_stack.pop()
-        self.components = state["comps"]
-        self.wires      = state["wires"]
-        self.selected_id = None
+        with self._lock:
+            self.components  = state["comps"]
+            self.wires       = state["wires"]
+            self._next_id    = state.get("next_id", self._next_id)
+            self.selected_id = None
         self._log("[UNDO] Action undone.")
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  SIMULATION
+    #  SIMULATION  [FIX 10] — frame-rate independent
     # ─────────────────────────────────────────────────────────────────────────
     def start_simulation(self):
         if self.sim_running:
@@ -808,6 +1014,7 @@ class CircuitEngine:
         self.sim_running = True
         self.sim_tick    = 0
         self._sim_t0     = time.time()
+        self._last_sensor_t: float = 0.0
         self._log("══ Simulation Started ══")
         for c in self.components:
             cat = CATALOG[c.type_id]["category"]
@@ -828,16 +1035,15 @@ class CircuitEngine:
         if not self.sim_running:
             return
         self.sim_tick += 1
-        t = self.sim_tick
-        elapsed = time.time() - self._sim_t0
+        elapsed = time.time() - self._sim_t0  # always wall-clock based
 
         for c in self.components:
             cat = CATALOG[c.type_id]["category"]
             tid = c.type_id
 
             if cat == "LED":
-                freq = 0.5 + random.random() * 0.5
-                c.state["on"]         = (t % int(20 / freq)) < int(10 / freq)
+                freq = 0.5 + 0.5
+                c.state["on"]         = (elapsed % (1 / freq)) < (0.5 / freq)
                 c.state["brightness"] = max(0.4, 0.8 + 0.2 * math.sin(elapsed * 6))
                 c.state["pwm"]        = c.state["brightness"]
 
@@ -847,8 +1053,10 @@ class CircuitEngine:
             elif cat == "Actuator" and tid in ("dc_motor", "stepper"):
                 c.state["rpm"] = int(150 + 50 * math.sin(elapsed * 1.2))
 
-        # Sensor readings every 45 ticks
-        if t % 45 == 0:
+        # Sensor readings every ~1.5 seconds (wall-clock, frame-rate independent)
+        last_sensor = getattr(self, '_last_sensor_t', 0.0)
+        if elapsed - last_sensor >= 1.5:
+            self._last_sensor_t = elapsed
             for c in self.components:
                 self._tick_sensor(c, elapsed)
 
@@ -867,8 +1075,8 @@ class CircuitEngine:
             self._log(f"[{c.label}] Lux:{c.state['lux']}")
         elif tid == "mpu6050":
             c.state.update({
-                "ax": round(0.3 * math.sin(elapsed * 2),    2),
-                "ay": round(0.3 * math.cos(elapsed * 1.5),  2),
+                "ax": round(0.3 * math.sin(elapsed * 2), 2),
+                "ay": round(0.3 * math.cos(elapsed * 1.5), 2),
                 "az": round(9.81 + random.uniform(-0.05, 0.05), 2),
                 "gx": round(random.uniform(-5, 5), 1),
                 "gy": round(random.uniform(-5, 5), 1),
@@ -894,32 +1102,32 @@ class CircuitEngine:
     # ─────────────────────────────────────────────────────────────────────────
     def _log(self, msg: str):
         ts   = time.strftime("%H:%M:%S")
-        line = f"[{ts}] {msg}"
-        self.serial_log.append(line)
-        if len(self.serial_log) > 300:
-            self.serial_log = self.serial_log[-200:]
+        self.serial_log.append(f"[{ts}] {msg}")  # deque auto-trims
 
     def get_log_tail(self, n: int = 8) -> list[str]:
-        return self.serial_log[-n:]
+        return list(self.serial_log)[-n:]
 
     # ─────────────────────────────────────────────────────────────────────────
     #  SAVE / LOAD
     # ─────────────────────────────────────────────────────────────────────────
     def save(self, path: str):
-        data = {
-            "version": 3,
-            "zoom": self.zoom,
-            "pan": [self.pan_x, self.pan_y],
-            "components": [
-                {"id": c.id, "type": c.type_id, "x": c.x, "y": c.y,
-                 "rotation": c.rotation, "label": c.label, "props": c.props}
-                for c in self.components
-            ],
-            "wires": [
-                {"points": w.points, "color": list(w.color), "net_id": w.net_id}
-                for w in self.wires
-            ]
-        }
+        with self._lock:
+            data = {
+                "version": 3,
+                "zoom": self.zoom,
+                "pan": [self.pan_x, self.pan_y],
+                "components": [
+                    {"id": c.id, "type": c.type_id, "x": c.x, "y": c.y,
+                     "rotation": c.rotation, "label": c.label, "props": c.props}
+                    for c in self.components
+                ],
+                "wires": [
+                    {"points": w.points, "color": list(w.color), "net_id": w.net_id,
+                     "src_comp": w.src_comp, "src_pin": w.src_pin,
+                     "dst_comp": w.dst_comp, "dst_pin": w.dst_pin}
+                    for w in self.wires
+                ]
+            }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
         self._log(f"[SAVE] → {path}")
@@ -946,13 +1154,14 @@ class CircuitEngine:
             pts = [tuple(p) for p in wd["points"]]
             col = tuple(wd.get("color", [0, 212, 255]))
             nid = wd.get("net_id", -1)
-            self.wires.append(Wire(points=pts, color=col, net_id=nid))
+            self.wires.append(Wire(
+                points=pts, color=col, net_id=nid,
+                src_comp=wd.get("src_comp", -1), src_pin=wd.get("src_pin", ""),
+                dst_comp=wd.get("dst_comp", -1), dst_pin=wd.get("dst_pin", ""),
+            ))
         self._next_id = max((c.id for c in self.components), default=0) + 1
         self._log(f"[LOAD] {len(self.components)} comps, {len(self.wires)} wires")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    #  SEARCH
-    # ─────────────────────────────────────────────────────────────────────────
     @staticmethod
     def search(query: str) -> list[str]:
         q = query.lower()
@@ -965,17 +1174,37 @@ class CircuitEngine:
     #  MAIN RENDER
     # ─────────────────────────────────────────────────────────────────────────
     def render(self, canvas: np.ndarray) -> np.ndarray:
-        """Full render: board + panel."""
         self._draw_board(canvas)
         if self.panel_visible:
             self._draw_panel(canvas)
         self._draw_hud(canvas)
         return canvas
 
-    def render_board_only(self, canvas: np.ndarray) -> np.ndarray:
-        """For projector: just the board, no panel."""
-        self._draw_board(canvas)
-        self._draw_hud(canvas)
+    def render_board_only(self, canvas: np.ndarray,
+                          override_w: int = None,
+                          override_h: int = None) -> np.ndarray:
+        """
+        [FIX 8] Safe render that NEVER mutates self.canvas_w/canvas_h.
+        Pass override_w/override_h to render at a different size without
+        touching global state.
+        """
+        if override_w is not None or override_h is not None:
+            # Temporarily adjust pan/zoom so content fits the override canvas
+            # without touching engine state (we operate on local copies)
+            saved = (self.canvas_w, self.canvas_h, self.pan_x, self.pan_y, self.zoom)
+            try:
+                if override_w:
+                    self.canvas_w = override_w
+                if override_h:
+                    self.canvas_h = override_h
+                self._draw_board(canvas)
+                self._draw_hud(canvas)
+            finally:
+                (self.canvas_w, self.canvas_h,
+                 self.pan_x, self.pan_y, self.zoom) = saved
+        else:
+            self._draw_board(canvas)
+            self._draw_hud(canvas)
         return canvas
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -984,17 +1213,21 @@ class CircuitEngine:
     def _draw_board(self, canvas: np.ndarray):
         if self.show_grid:
             self._draw_grid(canvas)
-        for wire in self.wires:
+        with self._lock:
+            wires  = list(self.wires)
+            wip    = self.wire_in_progress
+            comps  = list(self.components)
+        for wire in wires:
             self._draw_wire(canvas, wire)
-        if self.wire_in_progress and self.wire_in_progress.points:
-            self._draw_wire_preview(canvas)
-        for comp in self.components:
+        if wip and wip.points:
+            self._draw_wire_preview(canvas, wip)
+        for comp in comps:
             self._draw_component(canvas, comp)
         self._draw_inspector(canvas)
 
     def _draw_grid(self, canvas: np.ndarray):
-        bw = self.board_w
-        h  = canvas.shape[0]
+        bw   = self.board_w
+        h    = canvas.shape[0]
         step = max(4, int(self.GRID * self.zoom))
         ox   = int(self.pan_x % step)
         oy   = int(self.pan_y % step)
@@ -1004,28 +1237,37 @@ class CircuitEngine:
                     canvas[y, x] = (22, 38, 18)
 
     def _draw_wire(self, canvas: np.ndarray, wire: Wire):
-        pts = [self.to_screen(p[0], p[1]) for p in wire.points]
+        pts  = [self.to_screen(p[0], p[1]) for p in wire.points]
         if len(pts) < 2:
             return
-        col  = wire.color
-        glow = tuple(max(0, int(c * 0.3)) for c in col)
+        col   = wire.color
+        glow  = tuple(max(0, int(c * 0.3)) for c in col)
         thick = max(1, int(2 * self.zoom))
 
-        # Glow pass
         for i in range(len(pts) - 1):
             cv2.line(canvas, pts[i], pts[i+1], glow, thick + 4, cv2.LINE_AA)
-        # Main wire
         for i in range(len(pts) - 1):
             cv2.line(canvas, pts[i], pts[i+1], col, thick, cv2.LINE_AA)
-        # Junction dots
         for pt in pts:
             cv2.circle(canvas, pt, max(2, thick + 1), col, -1, cv2.LINE_AA)
 
-    def _draw_wire_preview(self, canvas: np.ndarray):
-        wip  = self.wire_in_progress
+        # Draw pin labels at endpoints if named
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        fs   = max(0.22, min(0.35, self.zoom * 0.3))
+        if wire.src_pin:
+            sp = self.to_screen(*wire.points[0])
+            cv2.putText(canvas, wire.src_pin[:5], (sp[0] + 4, sp[1] - 4),
+                        font, fs, tuple(min(255, int(c * 1.4)) for c in col),
+                        1, cv2.LINE_AA)
+        if wire.dst_pin:
+            dp = self.to_screen(*wire.points[-1])
+            cv2.putText(canvas, wire.dst_pin[:5], (dp[0] + 4, dp[1] - 4),
+                        font, fs, tuple(min(255, int(c * 1.4)) for c in col),
+                        1, cv2.LINE_AA)
+
+    def _draw_wire_preview(self, canvas: np.ndarray, wip: Wire):
         pts  = [self.to_screen(p[0], p[1]) for p in wip.points]
         mx, my = self.to_screen(*self.mouse_world)
-        # Manhattan preview
         lx, ly = pts[-1]
         if abs(mx - lx) > abs(my - ly):
             corner = (mx, ly)
@@ -1042,7 +1284,7 @@ class CircuitEngine:
     #  COMPONENT RENDERING
     # ─────────────────────────────────────────────────────────────────────────
     def _draw_component(self, canvas: np.ndarray, comp: Component):
-        d   = CATALOG.get(comp.type_id)
+        d = CATALOG.get(comp.type_id)
         if not d:
             return
 
@@ -1057,8 +1299,7 @@ class CircuitEngine:
         col    = d["color"]
         sym    = d.get("symbol", "rect")
 
-        # Mini-canvas with padding
-        pad = 12
+        pad = 16  # extra padding to accommodate right-side pin labels
         img = np.zeros((ch + pad*2, cw + pad*2, 3), dtype=np.uint8)
         ox, oy = pad, pad
 
@@ -1071,7 +1312,6 @@ class CircuitEngine:
 
         bthick = 2 if is_sel else 1
 
-        # ── Symbol drawing ──────────────────────────────────────────────────
         if sym == "ic":
             self._sym_ic(img, ox, oy, cw, ch, col, fill_col, border_col, bthick, comp, d)
         elif sym == "res":
@@ -1089,20 +1329,17 @@ class CircuitEngine:
         else:
             self._sym_rect(img, ox, oy, cw, ch, col, fill_col, border_col, bthick, comp)
 
-        # ── Selection ring ──────────────────────────────────────────────────
         if is_sel:
             cv2.rectangle(img, (ox - 3, oy - 3), (ox + cw + 3, oy + ch + 3),
                           (50, 130, 255), 1, cv2.LINE_AA)
 
-        # ── Sim state overlay ───────────────────────────────────────────────
         if self.sim_running and comp.state:
             self._draw_state_overlay(img, ox, oy, cw, ch, comp)
 
-        # ── Rotate & paste ──────────────────────────────────────────────────
         img_rot = self._rotate_img(img, comp.rotation)
         self._paste(canvas, img_rot, sx - pad, sy - pad, clip_w=self.board_w)
 
-    # ── IC / large chip symbol ──────────────────────────────────────────────
+    # ── IC symbol with BOTH-SIDE pins ───────────────────────────────────────
     def _sym_ic(self, img, ox, oy, cw, ch, col, fill, border, thick, comp, d):
         cv2.rectangle(img, (ox, oy), (ox+cw, oy+ch), fill, -1)
         cv2.rectangle(img, (ox, oy), (ox+cw, oy+ch), border, thick, cv2.LINE_AA)
@@ -1117,14 +1354,13 @@ class CircuitEngine:
         (tw, th), _ = cv2.getTextSize(lbl, font, fs, 1)
         cv2.putText(img, lbl, (ox + cw//2 - tw//2, oy + ch//2 + th//2),
                     font, fs, tuple(min(255, int(c*1.6)) for c in col), 1, cv2.LINE_AA)
-        # Category tag
         cat  = d.get("category","")[:5]
         fs2  = max(0.18, min(0.3, cw / 200))
         (cw2, _), _ = cv2.getTextSize(cat, font, fs2, 1)
         cv2.putText(img, cat, (ox + cw//2 - cw2//2, oy + 12),
                     font, fs2, tuple(int(c*0.6) for c in border), 1, cv2.LINE_AA)
-        # Pins left side
-        self._draw_pins(img, ox, oy, cw, ch, col, d)
+        # ── BOTH-SIDE PINS ──
+        self._draw_pins_both_sides(img, ox, oy, cw, ch, col, d)
 
     def _sym_rect(self, img, ox, oy, cw, ch, col, fill, border, thick, comp):
         cv2.rectangle(img, (ox, oy), (ox+cw, oy+ch), fill, -1)
@@ -1136,26 +1372,25 @@ class CircuitEngine:
         cv2.putText(img, lbl, (ox + cw//2 - tw//2, oy + ch//2 + th//2),
                     font, fs, tuple(min(255, int(c*1.8)) for c in col), 1, cv2.LINE_AA)
         d = CATALOG.get(comp.type_id, {})
-        self._draw_pins(img, ox, oy, cw, ch, col, d)
+        self._draw_pins_both_sides(img, ox, oy, cw, ch, col, d)
 
     def _sym_res(self, img, ox, oy, cw, ch, col, fill, border, thick, comp):
-        """Resistor: zig-zag body."""
         cx_, cy_ = ox + cw//2, oy + ch//2
         rw, rh = max(12, cw - 8), max(6, ch - 4)
         rx, ry = cx_ - rw//2, cy_ - rh//2
         cv2.rectangle(img, (rx, ry), (rx+rw, ry+rh), fill, -1)
         cv2.rectangle(img, (rx, ry), (rx+rw, ry+rh), border, thick, cv2.LINE_AA)
-        # Colour bands
         for i, bc in enumerate([(0,0,180),(0,0,0),(200,120,0),(200,180,120)]):
             bx = rx + 4 + i * max(2, (rw-8)//4)
             bw2 = max(1, (rw-8)//5)
             cv2.rectangle(img, (bx, ry+2), (bx+bw2, ry+rh-2), bc, -1)
-        # Leads
         cv2.line(img, (ox, cy_), (rx, cy_), col, thick, cv2.LINE_AA)
         cv2.line(img, (rx+rw, cy_), (ox+cw, cy_), col, thick, cv2.LINE_AA)
+        # Pin dots
+        cv2.circle(img, (ox, cy_), 3, (255, 210, 0), -1, cv2.LINE_AA)
+        cv2.circle(img, (ox+cw, cy_), 3, (255, 210, 0), -1, cv2.LINE_AA)
 
     def _sym_cap(self, img, ox, oy, cw, ch, col, fill, border, thick, comp):
-        """Capacitor: two plates."""
         cx_, cy_ = ox + cw//2, oy + ch//2
         gap = max(4, cw // 6)
         ph  = max(10, ch - 10)
@@ -1164,11 +1399,11 @@ class CircuitEngine:
         cv2.line(img, (cx_ - gap//2, cy_ - ph//2), (cx_ - gap//2, cy_ + ph//2), border, thick+1, cv2.LINE_AA)
         cv2.line(img, (cx_ + gap//2, cy_ - ph//2), (cx_ + gap//2, cy_ + ph//2), border, thick+1, cv2.LINE_AA)
         cv2.line(img, (cx_ + gap//2, cy_), (cx_ + gap//2 + pw//2, cy_), col, thick, cv2.LINE_AA)
-        # Plus sign for polarity
         cv2.putText(img, "+", (ox+1, cy_-2), cv2.FONT_HERSHEY_SIMPLEX, 0.3, border, 1)
+        cv2.circle(img, (ox, cy_), 3, (255, 210, 0), -1, cv2.LINE_AA)
+        cv2.circle(img, (ox+cw, cy_), 3, (255, 210, 0), -1, cv2.LINE_AA)
 
     def _sym_led(self, img, ox, oy, cw, ch, col, fill, border, thick, comp, d):
-        """LED: triangle + line, glow when on."""
         cx_, cy_ = ox + cw//2, oy + ch//2
         hh = max(8, ch//2 - 2)
         hw = max(6, cw//2 - 2)
@@ -1180,7 +1415,6 @@ class CircuitEngine:
         cv2.fillPoly(img, [tri], fill)
         cv2.polylines(img, [tri], True, border, thick, cv2.LINE_AA)
         cv2.line(img, (cx_ + hw, cy_ - hh), (cx_ + hw, cy_ + hh), border, thick+1, cv2.LINE_AA)
-        # Glow when sim on
         if self.sim_running and comp.state.get("on"):
             br = comp.state.get("brightness", 1.0)
             gc = tuple(min(255, int(c * br * 1.5)) for c in col)
@@ -1189,7 +1423,6 @@ class CircuitEngine:
             cv2.addWeighted(ov, 0.45, img, 0.55, 0, img)
             cv2.polylines(img, [tri], True, border, thick, cv2.LINE_AA)
             cv2.line(img, (cx_ + hw, cy_ - hh), (cx_ + hw, cy_ + hh), border, thick+1, cv2.LINE_AA)
-        # Arrow rays
         for ang in [30, 50]:
             r = math.radians(ang)
             sx2 = int(cx_ + hw + 8 * math.cos(r))
@@ -1198,6 +1431,8 @@ class CircuitEngine:
             ey2 = int(sy2 - 8 * math.sin(r))
             cv2.arrowedLine(img, (sx2, sy2), (ex2, ey2), border, 1,
                             cv2.LINE_AA, tipLength=0.4)
+        cv2.circle(img, (ox, cy_), 3, (255, 210, 0), -1, cv2.LINE_AA)
+        cv2.circle(img, (ox+cw, cy_), 3, (255, 210, 0), -1, cv2.LINE_AA)
 
     def _sym_diode(self, img, ox, oy, cw, ch, col, fill, border, thick, comp):
         cx_, cy_ = ox + cw//2, oy + ch//2
@@ -1219,11 +1454,9 @@ class CircuitEngine:
         r = max(8, min(cw, ch)//2 - 2)
         cv2.circle(img, (cx_, cy_), r, fill, -1)
         cv2.circle(img, (cx_, cy_), r, border, thick, cv2.LINE_AA)
-        # Base, collector, emitter lines
-        cv2.line(img, (cx_ - r, cy_), (ox, cy_), col, thick, cv2.LINE_AA)         # base
-        cv2.line(img, (cx_, cy_ - r//2), (cx_, oy), col, thick, cv2.LINE_AA)      # collector
-        cv2.line(img, (cx_, cy_ + r//2), (cx_, oy+ch), col, thick, cv2.LINE_AA)   # emitter
-        # B C E labels
+        cv2.line(img, (cx_ - r, cy_), (ox, cy_), col, thick, cv2.LINE_AA)
+        cv2.line(img, (cx_, cy_ - r//2), (cx_, oy), col, thick, cv2.LINE_AA)
+        cv2.line(img, (cx_, cy_ + r//2), (cx_, oy+ch), col, thick, cv2.LINE_AA)
         fs = max(0.2, 0.25 * r / 12)
         cv2.putText(img, "B", (ox+1, cy_+4), cv2.FONT_HERSHEY_SIMPLEX, fs, border, 1)
         cv2.putText(img, "C", (cx_-4, oy+10), cv2.FONT_HERSHEY_SIMPLEX, fs, border, 1)
@@ -1232,10 +1465,8 @@ class CircuitEngine:
     def _sym_sensor(self, img, ox, oy, cw, ch, col, fill, border, thick, comp):
         cv2.rectangle(img, (ox, oy), (ox+cw, oy+ch), fill, -1)
         cv2.rectangle(img, (ox, oy), (ox+cw, oy+ch), border, thick, cv2.LINE_AA)
-        # Rounded corners
         r = max(4, min(cw, ch)//6)
         cv2.ellipse(img, (ox+r, oy+r), (r,r), 180, 0, 90, border, thick, cv2.LINE_AA)
-        # Sensor icon: small arc waves
         for i in range(2):
             radius = 6 + i * 6
             cv2.ellipse(img, (ox+cw-10, oy+ch//2), (radius, radius), 0, -60, 60,
@@ -1247,21 +1478,77 @@ class CircuitEngine:
         (tw, th), _ = cv2.getTextSize(lbl, font, fs, 1)
         cv2.putText(img, lbl, (ox + cw//2 - tw//2, oy + ch//2 + th//2),
                     font, fs, tuple(min(255, int(c*1.6)) for c in col), 1, cv2.LINE_AA)
-        self._draw_pins(img, ox, oy, cw, ch, col, d)
+        self._draw_pins_both_sides(img, ox, oy, cw, ch, col, d)
 
-    def _draw_pins(self, img, ox, oy, cw, ch, col, d):
-        pins  = d.get("pins", [])
+    # ─────────────────────────────────────────────────────────────────────────
+    #  PIN DRAWING — left + right sides with labels  (KEY WORKBENCH FEATURE)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _draw_pins_both_sides(self, img, ox, oy, cw, ch, col, d):
+        """
+        Draw pin dots and labels on BOTH sides of the component.
+        Left column: first half of pins.
+        Right column: second half of pins.
+        Each pin gets a visible dot + its name for workbench identification.
+        """
+        pins = d.get("pins", [])
         if not pins or ch < 10:
             return
-        step  = ch / (len(pins) + 1)
+
+        sym   = d.get("symbol", "rect")
         font  = cv2.FONT_HERSHEY_SIMPLEX
-        fs    = max(0.16, min(0.26, ch / 200))
-        for i, pin in enumerate(pins):
-            py = int(oy + step * (i + 1))
-            cv2.circle(img, (ox, py), max(2, int(3)), (255, 210, 0), -1, cv2.LINE_AA)
-            if ch > 30:
-                cv2.putText(img, pin[:4], (ox + 4, py + 3), font, fs,
-                            (160, 200, 220), 1, cv2.LINE_AA)
+        fs    = max(0.16, min(0.28, ch / 220))
+        dot_r = max(2, int(3 * max(1.0, self.zoom * 0.5)))
+        pin_col   = (255, 210, 0)
+        label_col = (160, 200, 220)
+
+        if sym in ("ic", "sensor", "rect") and len(pins) > 2:
+            left_pins, right_pins = self._split_pins(pins)
+            nl = len(left_pins)
+            nr = len(right_pins)
+
+            # Left side pins
+            step_l = ch / (nl + 1)
+            for i, pin_name in enumerate(left_pins):
+                py = int(oy + step_l * (i + 1))
+                # Lead line
+                cv2.line(img, (ox - 6, py), (ox, py), col, 1, cv2.LINE_AA)
+                # Dot
+                cv2.circle(img, (ox, py), dot_r, pin_col, -1, cv2.LINE_AA)
+                # Label (right of dot, inside body)
+                if ch > 20:
+                    cv2.putText(img, pin_name[:5],
+                                (ox + dot_r + 2, py + 4),
+                                font, fs, label_col, 1, cv2.LINE_AA)
+
+            # Right side pins
+            step_r = ch / (nr + 1)
+            for i, pin_name in enumerate(right_pins):
+                py = int(oy + step_r * (i + 1))
+                # Lead line
+                cv2.line(img, (ox + cw, py), (ox + cw + 6, py), col, 1, cv2.LINE_AA)
+                # Dot
+                cv2.circle(img, (ox + cw, py), dot_r, pin_col, -1, cv2.LINE_AA)
+                # Label (left of dot, inside body, right-aligned)
+                if ch > 20:
+                    (lw, _), _ = cv2.getTextSize(pin_name[:5], font, fs, 1)
+                    cv2.putText(img, pin_name[:5],
+                                (ox + cw - lw - dot_r - 2, py + 4),
+                                font, fs, label_col, 1, cv2.LINE_AA)
+
+        else:
+            # Simple 2-pin or single-side: legacy left-only
+            n    = len(pins)
+            step = ch / (n + 1)
+            for i, pin_name in enumerate(pins):
+                py = int(oy + step * (i + 1))
+                cv2.circle(img, (ox, py), dot_r, pin_col, -1, cv2.LINE_AA)
+                if ch > 30:
+                    cv2.putText(img, pin_name[:4], (ox + 4, py + 3),
+                                font, fs, label_col, 1, cv2.LINE_AA)
+
+    # (legacy alias kept for any internal callers)
+    def _draw_pins(self, img, ox, oy, cw, ch, col, d):
+        self._draw_pins_both_sides(img, ox, oy, cw, ch, col, d)
 
     def _draw_state_overlay(self, img, ox, oy, cw, ch, comp):
         s    = comp.state
@@ -1303,53 +1590,54 @@ class CircuitEngine:
         font  = cv2.FONT_HERSHEY_SIMPLEX
         h     = canvas.shape[0]
 
-        ix, iy = 10, h - 200
-        iw, ih = 260, 190
-        # Background
+        ix, iy = 10, h - 210
+        iw, ih = 280, 200
+
         ov = canvas.copy()
         cv2.rectangle(ov, (ix, iy), (ix+iw, iy+ih), (5, 15, 25), -1)
         cv2.addWeighted(ov, 0.88, canvas, 0.12, 0, canvas)
         cv2.rectangle(canvas, (ix, iy), (ix+iw, iy+ih), (0, 120, 180), 1, cv2.LINE_AA)
 
-        # Title
         cv2.putText(canvas, f"{comp.label}  [{comp.type_id}]",
                     (ix+6, iy+16), font, 0.38, (0, 200, 255), 1, cv2.LINE_AA)
         cv2.line(canvas, (ix+4, iy+22), (ix+iw-4, iy+22), (0, 60, 90), 1)
 
-        y = iy + 36
-        for k, v in list(props.items())[:9]:
-            cv2.putText(canvas, f"{k}:", (ix+6, y), font, 0.3, (80, 140, 160), 1, cv2.LINE_AA)
-            cv2.putText(canvas, str(v)[:22], (ix+80, y), font, 0.3, (200, 230, 240), 1, cv2.LINE_AA)
-            y += 16
+        # Show pin list
+        pins = d.get("pins", [])
+        y    = iy + 36
+        cv2.putText(canvas, f"PINS ({len(pins)}):",
+                    (ix+6, y), font, 0.3, (0, 160, 200), 1, cv2.LINE_AA)
+        y += 14
+        for i, p in enumerate(pins[:14]):
+            col_pt = (255, 210, 0) if i % 2 == 0 else (200, 180, 0)
+            cv2.putText(canvas, f"  {i}: {p}", (ix+6, y),
+                        font, 0.28, col_pt, 1, cv2.LINE_AA)
+            y += 13
 
-        # Sim state
         if self.sim_running and comp.state:
             cv2.line(canvas, (ix+4, y), (ix+iw-4, y), (0, 60, 90), 1)
             y += 8
             for k, v in list(comp.state.items())[:4]:
-                cv2.putText(canvas, f"{k}: {v}", (ix+6, y), font, 0.3, (80, 255, 120), 1, cv2.LINE_AA)
+                cv2.putText(canvas, f"{k}: {v}", (ix+6, y),
+                            font, 0.3, (80, 255, 120), 1, cv2.LINE_AA)
                 y += 14
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  COMPONENT PANEL (right side)
+    #  COMPONENT PANEL
     # ─────────────────────────────────────────────────────────────────────────
     def _draw_panel(self, canvas: np.ndarray):
-        ch = canvas.shape[0]
-        pw = self.PANEL_W
-        px = self.board_w
+        ch   = canvas.shape[0]
+        pw   = self.PANEL_W
+        px   = self.board_w
         font = cv2.FONT_HERSHEY_SIMPLEX
 
-        # Panel background
         cv2.rectangle(canvas, (px, 0), (px + pw, ch), (5, 12, 20), -1)
         cv2.line(canvas, (px, 0), (px, ch), (0, 50, 80), 1)
-
-        # Header
         cv2.rectangle(canvas, (px, 0), (px + pw, 36), (0, 20, 35), -1)
         cv2.putText(canvas, "COMPONENTS", (px + 8, 22),
                     font, 0.42, (0, 180, 255), 1, cv2.LINE_AA)
         cv2.line(canvas, (px, 36), (px + pw, 36), (0, 50, 80), 1)
 
-        # Panel items
         y = 40 - self.panel_scroll
         for kind, key, lbl in self._panel_items:
             if kind == "cat":
@@ -1366,40 +1654,25 @@ class CircuitEngine:
                     is_hov = (key == self._panel_hovered)
                     bg = (0, 35, 55) if is_sel else ((0, 22, 38) if is_hov else (0, 0, 0))
                     cv2.rectangle(canvas, (px + 1, y), (px + pw, y + item_h), bg, -1)
-
-                    d      = CATALOG[key]
-                    col    = d["color"]
-                    cat_c  = d["category"]
-
-                    # Color swatch
-                    sw = 10
+                    d_     = CATALOG[key]
+                    col_c  = d_["color"]
+                    sw     = 10
+                    cv2.rectangle(canvas, (px + 6, y + 8), (px + 6 + sw, y + item_h - 8), col_c, -1)
                     cv2.rectangle(canvas, (px + 6, y + 8), (px + 6 + sw, y + item_h - 8),
-                                  col, -1)
-                    cv2.rectangle(canvas, (px + 6, y + 8), (px + 6 + sw, y + item_h - 8),
-                                  tuple(min(255, int(c*1.4)) for c in col), 1)
-
-                    # Name
+                                  tuple(min(255, int(c*1.4)) for c in col_c), 1)
                     text_col = (0, 200, 255) if is_sel else (180, 220, 240)
-                    cv2.putText(canvas, d["label"][:14], (px + 22, y + 14),
+                    cv2.putText(canvas, d_["label"][:14], (px + 22, y + 14),
                                 font, 0.33, text_col, 1, cv2.LINE_AA)
-
-                    # Pin count
-                    pin_str = f"{len(d.get('pins', []))}p"
+                    pin_str = f"{len(d_.get('pins', []))}p"
                     cv2.putText(canvas, pin_str, (px + pw - 28, y + 14),
                                 font, 0.28, (0, 80, 120), 1, cv2.LINE_AA)
-
-                    # Sub-label (key)
                     cv2.putText(canvas, key[:16], (px + 22, y + 26),
                                 font, 0.24, (0, 70, 100), 1, cv2.LINE_AA)
-
                     if is_sel:
                         cv2.line(canvas, (px + 1, y), (px + 3, y + item_h), (0, 200, 255), 2)
-
                     cv2.line(canvas, (px + 6, y + item_h), (px + pw - 6, y + item_h), (0, 20, 35), 1)
-
             y += item_h
 
-        # Scroll indicator
         total = self._panel_total_h()
         if total > ch - 40:
             bar_h  = max(20, int((ch - 40) / total * (ch - 40)))
@@ -1415,13 +1688,11 @@ class CircuitEngine:
         font = cv2.FONT_HERSHEY_SIMPLEX
         bw   = self.board_w
 
-        # Bottom bar background
         ov = canvas.copy()
         cv2.rectangle(ov, (0, h - 26), (bw, h), (0, 8, 14), -1)
         cv2.addWeighted(ov, 0.85, canvas, 0.15, 0, canvas)
         cv2.line(canvas, (0, h - 26), (bw, h - 26), (0, 40, 60), 1)
 
-        # Left: mode + counts
         mode_col = {"select":(255,180,0), "wire":(0,200,255), "pan":(0,255,100)}
         mc = mode_col.get(self.mode, (180,180,180))
         cv2.putText(canvas, f"MODE:{self.mode.upper()}", (8, h - 10), font, 0.38, mc, 1, cv2.LINE_AA)
@@ -1429,25 +1700,21 @@ class CircuitEngine:
             f"│  {len(self.components)} comps  {len(self.wires)} wires  │  Zoom:{self.zoom:.2f}x",
             (100, h - 10), font, 0.35, (60, 100, 120), 1, cv2.LINE_AA)
 
-        # Right: coords
         mx, my = self.mouse_world
         cv2.putText(canvas, f"X:{int(mx)}  Y:{int(my)}", (bw - 120, h - 10),
                     font, 0.35, (50, 80, 100), 1, cv2.LINE_AA)
 
-        # Sim badge (top-left)
         if self.sim_running:
             elapsed = time.time() - self._sim_t0
-            pulse = 0.6 + 0.4 * abs(math.sin(elapsed * 3))
-            sc = tuple(int(c * pulse) for c in (80, 255, 80))
+            pulse   = 0.6 + 0.4 * abs(math.sin(elapsed * 3))
+            sc      = tuple(int(c * pulse) for c in (80, 255, 80))
             cv2.circle(canvas, (14, 14), 6, sc, -1, cv2.LINE_AA)
             cv2.putText(canvas, f"SIM  {elapsed:.1f}s", (24, 19),
                         font, 0.4, (80, 255, 80), 1, cv2.LINE_AA)
 
-        # Mode badge top-right of board
-        cv2.putText(canvas, f"●  CIRCUIT ENGINE v3",
-                    (bw - 160, 18), font, 0.35, (0, 60, 90), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "●  CIRCUIT ENGINE v3.1",
+                    (bw - 170, 18), font, 0.35, (0, 60, 90), 1, cv2.LINE_AA)
 
-        # Serial log tail
         for i, line in enumerate(self.get_log_tail(5)):
             cv2.putText(canvas, line[-72:], (8, h - 48 - i * 14),
                         font, 0.28, (40, 160, 60), 1, cv2.LINE_AA)

@@ -1,38 +1,42 @@
 """
-gesture_engine.py  —  AIILA Gesture Engine v3
+gesture_engine.py  —  AIILA Gesture Engine v4
 ===============================================
-Root-cause fixes:
+Changes from v3:
 
-PROBLEM 1 — Grab/Throw detected as Pinch
-  Root cause: pinch only checked thumb-index distance, which is small even
-  in a fist. Fix: pinch is now BLOCKED when is_fist=True (all 4 fingers
-  curled >0.50). Fist → pinch conflict is impossible.
+FIX 1 — CLAW_ROTATE now tracks wrist ROLL (hand twist around its own axis)
+  Root cause in v3: palm normal projected onto XY plane barely moves during
+  a wrist roll because the normal is nearly perpendicular to XY to begin
+  with. A 90° wrist roll barely changed the atan2(ny, nx) angle.
 
-PROBLEM 2 — Claw rotation not detected
-  Root cause: old engine had no claw detector at all (it only had 2-hand
-  rotate). Fix: added dedicated CLAW_ROTATE detector that fires when all 5
-  fingers are semi-curled (0.28–0.76) AND the palm normal rotates >6° from
-  the previous frame. Uses atan2 of the projected normal vector so it
-  responds to both wrist roll and hand twist.
+  Fix: instead of using the palm normal direction, we now track the *INDEX
+  finger knuckle angle relative to the PINKY knuckle* in camera space —
+  i.e. the angle of the line INDEX_MCP→PINKY_MCP in 2-D (XY). This line
+  rotates exactly as much as the hand rolls, is insensitive to hand tilt
+  or translation, and needs no 3-D math. We call this the "roll angle".
 
-PROBLEM 3 — Swipe unreliable
-  Root cause: using palm centre (very stable) with only 14 frames. Palm
-  barely moves on a fast flick. Fix: swipe now tracks INDEX-TIP (moves 2×
-  more than palm on a flick), uses 10-frame window, and requires only 60%
-  directional consistency instead of implicit threshold. Speed threshold
-  lowered to 0.022 (was implicitly ~0.035). Pinch/fist/claw block it so
-  no false-positives.
+  Additionally we also compute the "pitch" angle using the WRIST→MIDDLE_MCP
+  vector in XY and average both signals to get a robust rotation estimate
+  that covers wrist roll AND tilting the wrist up/down (pronation/
+  supination). Signed delta is accumulated and fires when >= CLAW_ROT_THRESH.
 
-Additional improvements:
-  • PinchState.HOLDING fires every frame between grab and drag so the
-    kernel knows the grab is still live even without movement.
-  • Throw uses a tighter fist definition (curl>0.52 for all 4 fingers) and
-    arms itself after just 5 fist frames to catch quick grabs.
-  • Crumple uses spread of ALL 5 fingertips relative to palm (more robust
-    than just index-middle spread which can change during pinch).
-  • Dwell tracks index TIP rather than palm centre.
-  • All detectors share a single _hand_size_ref EMA so thresholds scale
-    naturally with hand distance from camera.
+FIX 2 — CRUMPLE is now a TWO-HAND gesture (paper crumple)
+  Root cause in v3: single-hand open↔close flips are too easy to trigger
+  accidentally (e.g. during a pinch or claw) and don't match the intuitive
+  "crumple a piece of paper" motion.
+
+  Fix: CRUMPLE now requires BOTH hands to be visible. It watches for:
+    Phase 1 – SPREAD: both hands open, palms apart (distance > threshold)
+    Phase 2 – SQUEEZE: both hands simultaneously close into fists AND move
+              toward each other (inter-palm distance shrinks by >MIN_SHRINK)
+  The phase transition must happen within CRUMPLE_WINDOW seconds.
+  Confidence scales with how much the hands squeezed relative to the
+  initial spread distance.
+
+Other minor improvements:
+  • CLAW_ROT_THRESH lowered slightly (5° instead of 6°) since the new
+    roll-angle signal is more direct and less noisy.
+  • _reset_crumple now clears two-hand state fully.
+  • _reset_claw clears the new roll_angle_prev field.
 """
 
 from __future__ import annotations
@@ -55,8 +59,8 @@ class GestureType(str, Enum):
     SWIPE        = "swipe"
     CRUMPLE      = "crumple"
     THROW        = "throw"
-    CLAW_ROTATE  = "claw_rotate"   # one-hand claw twist
-    ROTATE       = "rotate"        # two-hand rotate
+    CLAW_ROTATE  = "claw_rotate"
+    ROTATE       = "rotate"
     DWELL        = "dwell"
     PEACE        = "peace"
 
@@ -125,6 +129,7 @@ class HandState:
     hand_open:   bool         # ≥4 non-thumb fingers extended
     is_fist:     bool         # all 4 non-thumb fingers curl > 0.50
     is_claw:     bool         # all 5 fingers semi-curled (0.28–0.76)
+    roll_angle:  float        # angle (deg) of INDEX_MCP→PINKY_MCP in XY — tracks wrist roll
     handedness:  str
 
 
@@ -190,11 +195,6 @@ def _d3(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _curl_angle(lms: np.ndarray, tip: int, pip: int, mcp: int) -> float:
-    """
-    Joint angle 0=straight, 1=fully curled.
-    Uses the angle between the mcp→pip and pip→tip vectors in 3-D so it
-    works regardless of hand orientation in frame.
-    """
     v1 = lms[pip] - lms[mcp]
     v2 = lms[tip] - lms[pip]
     n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
@@ -212,12 +212,33 @@ def _palm_normal(lms: np.ndarray) -> np.ndarray:
     return n / mag if mag > 1e-6 else np.array([0.0, 0.0, 1.0], dtype=np.float32)
 
 
+def _roll_angle_deg(lms: np.ndarray) -> float:
+    """
+    Angle of the INDEX_MCP → PINKY_MCP vector in XY (camera) space.
+    This line rotates directly with wrist roll/twist and is independent of
+    hand translation or depth. Returns degrees in (-180, 180].
+
+    We blend with the WRIST→MIDDLE_MCP angle (pitch proxy) using a 70/30
+    weighting so subtle wrist tilts that don't fully roll the knuckle line
+    still register.
+    """
+    # Primary: knuckle line across hand
+    dx1 = float(lms[PINKY_MCP][0] - lms[INDEX_MCP][0])
+    dy1 = float(lms[PINKY_MCP][1] - lms[INDEX_MCP][1])
+    a1  = math.degrees(math.atan2(dy1, dx1))
+
+    # Secondary: wrist → middle knuckle (captures pronation/supination)
+    dx2 = float(lms[MIDDLE_MCP][0] - lms[WRIST][0])
+    dy2 = float(lms[MIDDLE_MCP][1] - lms[WRIST][1])
+    a2  = math.degrees(math.atan2(dy2, dx2))
+
+    return 0.70 * a1 + 0.30 * a2
+
+
 def _build_state(lms: np.ndarray, handedness: str, hand_size_ref: float) -> HandState:
-    # ── Curl for each finger ────────────────────────────────────────────────
     curls: list[float] = []
     ext:   list[bool]  = []
 
-    # Thumb: compare tip→wrist vs IP→wrist (robust across orientations)
     tc = _curl_angle(lms, THUMB_TIP, THUMB_IP, THUMB_MCP)
     curls.append(tc)
     ext.append(_d3(lms[THUMB_TIP], lms[WRIST]) > _d3(lms[THUMB_IP], lms[WRIST]) * 1.05)
@@ -230,22 +251,15 @@ def _build_state(lms: np.ndarray, handedness: str, hand_size_ref: float) -> Hand
     ]:
         c = _curl_angle(lms, tip_i, pip_i, mcp_i)
         curls.append(c)
-        # Extended: tip higher (lower y) than PIP AND curl < 0.50
         ext.append(bool(lms[tip_i][1] < lms[pip_i][1]) and c < 0.50)
 
     hsize = max(_d3(lms[WRIST], lms[MIDDLE_MCP]), 1e-6)
-
-    # Fist: all 4 non-thumb fingers tightly curled
     is_fist = all(curls[i] > 0.50 for i in range(1, 5))
-
-    # Claw: all 5 fingers semi-curled (classic "grab a ball" pose)
-    # thumb slightly extended (curl 0.25–0.70), rest 0.28–0.76
     is_claw = (
         0.22 <= curls[0] <= 0.75 and
         all(0.28 <= curls[i] <= 0.78 for i in range(1, 5))
     )
 
-    # Spread: mean distance between adjacent fingertips (normalised by hand size)
     spread = float(np.mean([
         _d2(lms[INDEX_TIP],  lms[MIDDLE_TIP]),
         _d2(lms[MIDDLE_TIP], lms[RING_TIP]),
@@ -265,6 +279,7 @@ def _build_state(lms: np.ndarray, handedness: str, hand_size_ref: float) -> Hand
         hand_open   = sum(ext[1:]) >= 4,
         is_fist     = is_fist,
         is_claw     = is_claw,
+        roll_angle  = _roll_angle_deg(lms),
         handedness  = handedness,
     )
 
@@ -282,35 +297,38 @@ class GestureEngine:
         # returns list[dict] sorted by priority, highest first.
     """
 
-    # ── Tuning knobs ────────────────────────────────────────────────────────
-    # Pinch
-    PINCH_GRAB_RATIO    = 0.36   # thumb-index dist / hand_size → grab
-    PINCH_RELEASE_RATIO = 0.60   # dist / hand_size → release
-    PINCH_MIN_OPEN      = 2      # ≥ this many non-thumb fingers open to allow pinch
+    # ── Pinch ───────────────────────────────────────────────────────────────
+    PINCH_GRAB_RATIO    = 0.36
+    PINCH_RELEASE_RATIO = 0.60
+    PINCH_MIN_OPEN      = 2
 
-    # Swipe
-    SWIPE_WIN           = 10     # frames of history
-    SWIPE_MIN_SPEED     = 0.022  # mean per-frame displacement (0-1 coords)
-    SWIPE_CONSISTENCY   = 0.60   # fraction of frames in dominant direction
+    # ── Swipe ───────────────────────────────────────────────────────────────
+    SWIPE_WIN           = 10
+    SWIPE_MIN_SPEED     = 0.022
+    SWIPE_CONSISTENCY   = 0.60
 
-    # Throw (fist → open release)
-    THROW_FIST_FRAMES   = 5      # fist frames needed to arm
-    THROW_VEL_THRESH    = 0.045  # mean 0-1/frame velocity to fire
+    # ── Throw ───────────────────────────────────────────────────────────────
+    THROW_FIST_FRAMES   = 5
+    THROW_VEL_THRESH    = 0.045
 
-    # Claw rotate
-    CLAW_MIN_FRAMES     = 4      # frames of claw before tracking starts
-    CLAW_ROT_THRESH     = 6.0    # degrees accumulated before firing
-    CLAW_MAX_ACCUM      = 90.0   # cap accumulator to avoid ghost fires
+    # ── Claw Rotate ─────────────────────────────────────────────────────────
+    CLAW_MIN_FRAMES     = 4
+    CLAW_ROT_THRESH     = 5.0    # lowered from 6 — roll signal is cleaner
+    CLAW_MAX_ACCUM      = 90.0
 
-    # Crumple
-    CRUMPLE_TRANSITIONS = 5      # open↔close flips within window
-    CRUMPLE_WINDOW      = 1.5    # seconds
+    # ── Two-hand Crumple ────────────────────────────────────────────────────
+    # Phase 1 (spread): both hands open, at least this far apart (0-1 coords)
+    CRUMPLE_MIN_SPREAD_DIST  = 0.20   # inter-palm distance to "arm" crumple
+    # Phase 2 (squeeze): distance must shrink by at least this fraction of initial
+    CRUMPLE_MIN_SHRINK_FRAC  = 0.35   # 35% closer than the armed distance
+    CRUMPLE_FIST_REQUIRED    = 2      # how many non-thumb fingers must curl on each hand
+    CRUMPLE_WINDOW           = 2.0    # seconds from arm to fire
 
-    # Dwell
+    # ── Dwell ───────────────────────────────────────────────────────────────
     DWELL_FRAMES        = 26
-    DWELL_MOVE_RATIO    = 0.18   # relative to hand_size
+    DWELL_MOVE_RATIO    = 0.18
 
-    # Peace
+    # ── Peace ───────────────────────────────────────────────────────────────
     PEACE_FRAMES        = 10
 
     def __init__(self,
@@ -353,14 +371,16 @@ class GestureEngine:
         self._throw_hist: deque = deque(maxlen=14)
 
     def _reset_claw(self):
-        self._claw_frames     = 0
-        self._claw_prev_norm: Optional[np.ndarray] = None
-        self._claw_accum      = 0.0
-        self._claw_active     = False
+        self._claw_frames         = 0
+        self._claw_roll_angle_prev: Optional[float] = None   # ← new: track roll angle
+        self._claw_accum          = 0.0
+        self._claw_active         = False
 
     def _reset_crumple(self):
-        self._crumple_ts:    deque = deque(maxlen=40)
-        self._crumple_state: Optional[str] = None
+        # Two-hand crumple state machine
+        self._crumple_armed      = False
+        self._crumple_armed_dist: float = 0.0
+        self._crumple_armed_ts:   float = 0.0
 
     def _reset_dwell(self):
         self._dwell_frames = 0
@@ -383,7 +403,6 @@ class GestureEngine:
                    if handedness and i < len(handedness) else "Right")
             states.append(_build_state(lms, h, self._hand_size_ref))
 
-        # Update adaptive hand-size reference
         self._hand_size_ref = (0.96 * self._hand_size_ref
                                 + 0.04 * states[0].hand_size)
 
@@ -398,16 +417,19 @@ class GestureEngine:
 
         _try(self._detect_throw(primary, cursor))
         _try(self._detect_claw_rotate(primary, cursor))
-        _try(self._detect_crumple(primary, cursor))
         _try(self._detect_swipe(primary, cursor))
         _try(self._detect_pinch(primary, cursor))
         _try(self._detect_dwell(primary, cursor))
         _try(self._detect_peace(primary, cursor))
 
+        # Two-hand gestures
         if len(states) >= 2:
+            _try(self._detect_crumple(states[0], states[1], cursor))
             _try(self._detect_two_hand_rotate(states[0], states[1], cursor))
+        else:
+            # No second hand: reset crumple so it re-arms properly
+            self._reset_crumple()
 
-        # Sort by priority; keep only first of each gesture type
         candidates.sort(key=lambda e: _PRIORITY.get(e.gesture, 0), reverse=True)
         seen: set[GestureType] = set()
         final: list[GestureEvent] = []
@@ -428,17 +450,15 @@ class GestureEngine:
                 int(lms[tip][1] * self.canvas_h))
 
     # ═════════════════════════════════════════════════════════════════════════
-    #  PINCH  — thumb+index close, other fingers NOT in a fist
+    #  PINCH
     # ═════════════════════════════════════════════════════════════════════════
 
     def _detect_pinch(self, hs: HandState, cursor: tuple) -> Optional[GestureEvent]:
-        # KEY FIX: if hand is a fist, this belongs to grab/throw — never pinch
         if hs.is_fist:
             if self._pinching:
                 self._reset_pinch()
             return None
 
-        # Require enough open fingers so claw/full-curl can't trigger pinch
         if sum(hs.fingers[1:]) < self.PINCH_MIN_OPEN and not self._pinching:
             return None
 
@@ -477,7 +497,7 @@ class GestureEngine:
 
             delta = cur_f - self._pinch_last_px
             self._pinch_last_px = cur_f.copy()
-            moving = np.linalg.norm(delta) > 0.8   # > 0.8 pixels
+            moving = np.linalg.norm(delta) > 0.8
 
             state_val = PinchState.DRAG.value if moving else PinchState.HOLDING.value
             return GestureEvent(**{**base,
@@ -491,16 +511,14 @@ class GestureEngine:
         return None
 
     # ═════════════════════════════════════════════════════════════════════════
-    #  SWIPE  — index TIP fast directional motion
+    #  SWIPE
     # ═════════════════════════════════════════════════════════════════════════
 
     def _detect_swipe(self, hs: HandState, cursor: tuple) -> Optional[GestureEvent]:
-        # Block during pinch, fist, or claw
         if self._pinching or hs.is_fist or hs.is_claw:
             self._reset_swipe()
             return None
 
-        # Track index-finger TIP in 0-1 space (moves more than palm)
         tip = hs.landmarks[INDEX_TIP][:2].copy()
         self._swipe_hist.append(tip)
 
@@ -508,8 +526,8 @@ class GestureEngine:
             return None
 
         pts    = np.array(self._swipe_hist)
-        deltas = np.diff(pts, axis=0)                    # (N-1, 2)
-        speeds = np.linalg.norm(deltas, axis=1)          # per-frame
+        deltas = np.diff(pts, axis=0)
+        speeds = np.linalg.norm(deltas, axis=1)
 
         mean_speed = speeds.mean()
         if mean_speed < self.SWIPE_MIN_SPEED:
@@ -530,7 +548,7 @@ class GestureEngine:
             return None
 
         conf = float(min(1.0, mean_speed / self.SWIPE_MIN_SPEED * 0.6 + 0.4))
-        self._reset_swipe()   # clear history so one gesture fires per motion
+        self._reset_swipe()
 
         return GestureEvent(
             gesture    = GestureType.SWIPE,
@@ -546,7 +564,7 @@ class GestureEngine:
         )
 
     # ═════════════════════════════════════════════════════════════════════════
-    #  THROW  — strict fist → velocity burst → open hand
+    #  THROW
     # ═════════════════════════════════════════════════════════════════════════
 
     def _detect_throw(self, hs: HandState, cursor: tuple) -> Optional[GestureEvent]:
@@ -560,10 +578,8 @@ class GestureEngine:
             self._throw_hist.append(palm_px.copy())
             if self._fist_frames >= self.THROW_FIST_FRAMES:
                 self._throw_armed = True
-            # While fisting, suppress everything below in priority
             return None
 
-        # Hand opened after fist
         if self._throw_armed and hs.hand_open:
             self._throw_armed = False
             hist = list(self._throw_hist)
@@ -592,7 +608,6 @@ class GestureEngine:
             self._fist_frames = 0
             self._throw_hist.clear()
 
-        # Open hand but was never armed
         if hs.hand_open and not self._throw_armed:
             self._fist_frames = 0
             self._throw_hist.clear()
@@ -600,58 +615,54 @@ class GestureEngine:
         return None
 
     # ═════════════════════════════════════════════════════════════════════════
-    #  CLAW ROTATE  — claw pose + palm normal rotation
+    #  CLAW ROTATE  — tracks wrist ROLL via knuckle-line angle in XY
     # ═════════════════════════════════════════════════════════════════════════
 
     def _detect_claw_rotate(self, hs: HandState, cursor: tuple) -> Optional[GestureEvent]:
         if not hs.is_claw:
-            # Gradually reset so brief claw breaks don't abort mid-rotation
             self._claw_frames = max(0, self._claw_frames - 2)
             if self._claw_frames == 0:
-                self._claw_prev_norm = None
-                self._claw_accum     = 0.0
-                self._claw_active    = False
+                self._claw_roll_angle_prev = None
+                self._claw_accum           = 0.0
+                self._claw_active          = False
             return None
 
         self._claw_frames = min(self._claw_frames + 1, 200)
 
         if self._claw_frames < self.CLAW_MIN_FRAMES:
-            self._claw_prev_norm = hs.palm_normal.copy()
+            # Seed the reference angle so the first real delta is valid
+            self._claw_roll_angle_prev = hs.roll_angle
             return None
 
         self._claw_active = True
 
-        if self._claw_prev_norm is None:
-            self._claw_prev_norm = hs.palm_normal.copy()
+        if self._claw_roll_angle_prev is None:
+            self._claw_roll_angle_prev = hs.roll_angle
             return None
 
-        # ── Signed rotation in XY plane (camera-facing rotation) ────────────
-        prev = self._claw_prev_norm
-        curr = hs.palm_normal
+        # Signed angular delta — wrap to ±180°
+        raw_delta = hs.roll_angle - self._claw_roll_angle_prev
+        delta = (raw_delta + 180.0) % 360.0 - 180.0
 
-        prev_a = math.degrees(math.atan2(float(prev[1]), float(prev[0])))
-        curr_a = math.degrees(math.atan2(float(curr[1]), float(curr[0])))
-        delta  = (curr_a - prev_a + 180.0) % 360.0 - 180.0   # wrap ±180°
-
-        # Reject tiny jitter (<0.5°) and huge jumps (>45°, likely normal flip)
-        if abs(delta) < 0.5 or abs(delta) > 45.0:
-            self._claw_prev_norm = curr.copy()
+        # Reject tiny jitter and physically impossible jumps
+        if abs(delta) < 0.8 or abs(delta) > 50.0:
+            self._claw_roll_angle_prev = hs.roll_angle
             return None
 
         self._claw_accum += delta
         self._claw_accum  = max(-self.CLAW_MAX_ACCUM,
                                 min(self.CLAW_MAX_ACCUM, self._claw_accum))
-        self._claw_prev_norm = curr.copy()
+        self._claw_roll_angle_prev = hs.roll_angle
 
         if abs(self._claw_accum) < self.CLAW_ROT_THRESH:
             return None
 
         fired            = self._claw_accum
-        self._claw_accum = 0.0   # reset accumulator
+        self._claw_accum = 0.0
 
         return GestureEvent(
             gesture    = GestureType.CLAW_ROTATE,
-            confidence = min(1.0, abs(fired) / 20.0 + 0.60),
+            confidence = min(1.0, abs(fired) / 18.0 + 0.60),
             cursor     = cursor,
             fingers    = hs.fingers,
             hand_open  = hs.hand_open,
@@ -695,41 +706,70 @@ class GestureEngine:
         )
 
     # ═════════════════════════════════════════════════════════════════════════
-    #  CRUMPLE  — rapid open ↔ close transitions
-    #  Uses spread of ALL fingertips relative to palm — more robust than
-    #  just index-middle spread which changes during pinch/claw.
+    #  CRUMPLE  — two-hand paper crumple (spread → squeeze)
+    #
+    #  State machine:
+    #    IDLE → ARMED  when both hands open AND inter-palm dist > MIN_SPREAD_DIST
+    #    ARMED → FIRE  when both hands close (≥ FIST_REQUIRED curled fingers
+    #                  on each hand) AND inter-palm dist shrank ≥ MIN_SHRINK_FRAC
+    #                  of the armed distance — all within CRUMPLE_WINDOW seconds.
+    #    FIRE  → IDLE  immediately after emitting event
+    #    ARMED → IDLE  if CRUMPLE_WINDOW expires without squeeze
     # ═════════════════════════════════════════════════════════════════════════
 
-    def _detect_crumple(self, hs: HandState, cursor: tuple) -> Optional[GestureEvent]:
-        # State based on average tip-to-palm distance
-        tips_to_palm = float(np.mean([
-            _d2(hs.landmarks[t], hs.palm_center[:2])
-            for t in [INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP]
-        ]))
-        state = 'open' if tips_to_palm > self._hand_size_ref * 1.0 else 'closed'
+    def _detect_crumple(self,
+                        ha: HandState,
+                        hb: HandState,
+                        cursor: tuple) -> Optional[GestureEvent]:
+        inter_dist = float(_d2(ha.palm_center[:2], hb.palm_center[:2]))
 
-        if state != self._crumple_state:
-            self._crumple_ts.append(time.time())
-            self._crumple_state = state
+        # Count curled non-thumb fingers on each hand
+        curled_a = sum(1 for i in range(1, 5) if ha.curl[i] > 0.50)
+        curled_b = sum(1 for i in range(1, 5) if hb.curl[i] > 0.50)
+
+        both_open   = ha.hand_open and hb.hand_open
+        both_closed = (curled_a >= self.CRUMPLE_FIST_REQUIRED and
+                       curled_b >= self.CRUMPLE_FIST_REQUIRED)
 
         now = time.time()
-        while self._crumple_ts and self._crumple_ts[0] < now - self.CRUMPLE_WINDOW:
-            self._crumple_ts.popleft()
 
-        if len(self._crumple_ts) >= self.CRUMPLE_TRANSITIONS:
-            self._crumple_ts.clear()
-            return GestureEvent(
-                gesture    = GestureType.CRUMPLE,
-                confidence = 0.92,
-                cursor     = cursor,
-                fingers    = hs.fingers,
-                hand_open  = hs.hand_open,
-                handedness = hs.handedness,
-            )
+        # ── Phase 2: already armed, check for squeeze ────────────────────────
+        if self._crumple_armed:
+            if now - self._crumple_armed_ts > self.CRUMPLE_WINDOW:
+                # Timed out
+                self._reset_crumple()
+                return None
+
+            if both_closed:
+                shrink = (self._crumple_armed_dist - inter_dist) / max(self._crumple_armed_dist, 1e-6)
+                if shrink >= self.CRUMPLE_MIN_SHRINK_FRAC:
+                    self._reset_crumple()
+                    conf = float(min(1.0, 0.70 + shrink * 0.60))
+                    return GestureEvent(
+                        gesture    = GestureType.CRUMPLE,
+                        confidence = conf,
+                        cursor     = cursor,
+                        fingers    = ha.fingers,
+                        hand_open  = False,
+                        handedness = "Both",
+                        data       = {
+                            'shrink_frac':   round(shrink, 3),
+                            'initial_dist':  round(self._crumple_armed_dist, 3),
+                            'final_dist':    round(inter_dist, 3),
+                        }
+                    )
+            return None
+
+        # ── Phase 1: watch for open-hands spread ─────────────────────────────
+        if both_open and inter_dist >= self.CRUMPLE_MIN_SPREAD_DIST:
+            self._crumple_armed      = True
+            self._crumple_armed_dist = inter_dist
+            self._crumple_armed_ts   = now
+
         return None
 
     # ═════════════════════════════════════════════════════════════════════════
-    #  DWELL  — index only, held still
+    #  DWELL
     # ═════════════════════════════════════════════════════════════════════════
 
     def _detect_dwell(self, hs: HandState, cursor: tuple) -> Optional[GestureEvent]:
@@ -777,7 +817,7 @@ class GestureEngine:
         )
 
     # ═════════════════════════════════════════════════════════════════════════
-    #  PEACE  — index + middle extended, rest curled
+    #  PEACE
     # ═════════════════════════════════════════════════════════════════════════
 
     def _detect_peace(self, hs: HandState, cursor: tuple) -> Optional[GestureEvent]:
@@ -785,7 +825,7 @@ class GestureEngine:
             hs.fingers[1] and hs.fingers[2]
             and not hs.fingers[3]
             and not hs.fingers[4]
-            and hs.curl[0] > 0.38        # thumb curled in
+            and hs.curl[0] > 0.38
         )
         if is_peace:
             self._peace_frames += 1
