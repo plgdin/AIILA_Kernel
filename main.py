@@ -1,50 +1,68 @@
 import sys
 import ctypes
 import threading
-from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import Qt
-from interface.ui_hub import UIHub
-from core.main_kernel import AIILAKernel
+import traceback
 import multiprocessing as mp
 
+from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtCore import Qt
+
+from interface.ui_hub import UIHub
+from core.main_kernel import AIILAKernel
+
+
 def launch():
-    # --- PYQT6 DPI CONFIGURATION ---
-    # We let PyQt6 handle DPI context natively to avoid "Access Denied" errors.
-    # This ensures your 1920x1080 projector window maps to physical pixels correctly.
+
+    # ── DPI awareness (Windows) ───────────────────────────────────────────────
     if sys.platform == 'win32':
         try:
-            # Setting HighDPI scaling attributes before creating the Application
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             pass
 
-    # --- PYQT6 APPLICATION INITIALIZATION ---
+    # ── Application ──────────────────────────────────────────────────────────
     app = QApplication(sys.argv)
-    
-    # Initialize Kernel Logic
+    app.setStyle('Fusion')   # consistent cross-platform look
+
+    # ── Global exception handler — shows a dialog instead of silent crash ────
+    def _handle_exception(exc_type, exc_value, exc_tb):
+        msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        print(msg, file=sys.stderr)
+        try:
+            dlg = QMessageBox()
+            dlg.setWindowTitle("AIILA — Unhandled Error")
+            dlg.setIcon(QMessageBox.Icon.Critical)
+            dlg.setText(str(exc_value))
+            dlg.setDetailedText(msg)
+            dlg.exec()
+        except Exception:
+            pass   # if Qt itself is broken, just print to stderr
+    sys.excepthook = _handle_exception
+
+    # ── Kernel ────────────────────────────────────────────────────────────────
     kernel = AIILAKernel()
-    
-    # Initialize PyQt6 UI and link to Kernel
-    # The UIHub now manages its own high-speed QTimer for polling
+
+    # ── UI ────────────────────────────────────────────────────────────────────
     window = UIHub(kernel)
-    
-    # Linking the Kernel callback to the UI bridge
     kernel.gui_callback = window.update_display
-    
-    # Display the Main Dashboard
     window.show()
 
-    # --- KERNEL BACKGROUND THREAD ---
-    # Separation of tracking logic and UI rendering is vital for responsiveness
-    thread = threading.Thread(target=kernel.run, daemon=True)
+    # ── Kernel thread ─────────────────────────────────────────────────────────
+    thread = threading.Thread(target=_run_kernel_safe, args=(kernel,), daemon=True)
     thread.start()
-    
-    # Start the hardware-accelerated event loop
+
     sys.exit(app.exec())
 
-# --- CRITICAL MULTIPROCESSING SAFETY GUARD ---
-# Mandatory on Windows when using mp.Process to avoid infinite recursion.
+
+def _run_kernel_safe(kernel: AIILAKernel):
+    """Wraps kernel.run() so a crash in the background thread is printed clearly."""
+    try:
+        kernel.run()
+    except Exception:
+        traceback.print_exc()
+        kernel.running = False   # stop the loop cleanly on error
+
+
 if __name__ == "__main__":
-    # Required for Windows multiprocessing support
-    mp.freeze_support() 
+    mp.freeze_support()
     launch()
