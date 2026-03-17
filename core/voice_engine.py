@@ -102,11 +102,19 @@ def listen_and_process_command(app_state):
             app_state['dynamic_ar_text'] = display_text
             app_state['voice_feedback'] = "AIILA: Online."
 
-    except sr.UnknownValueError:
+    except sr.UnknownValueError as uve:
+        print(f"[VOICE ENGINE] UnknownValueError: No audio recognized or speech unintelligible. Details: {uve}")
         app_state['voice_feedback'] = "AIILA: Speech not understood."
-    except sr.RequestError:
+    except sr.RequestError as re:
+        print(f"[VOICE ENGINE] RequestError: Could not request results from service. Details: {re}")
         app_state['voice_feedback'] = "AIILA: API Connection Error."
+    except sr.WaitTimeoutError:
+        print(f"[VOICE ENGINE] WaitTimeoutError: Listening timed out before speech started.")
+        app_state['voice_feedback'] = "AIILA: Listening timed out."
     except Exception as e:
+        print(f"[VOICE ENGINE] General Exception: {type(e).__name__} - {str(e)}")
+        import traceback
+        traceback.print_exc()
         app_state['voice_feedback'] = f"System Error: {str(e)}"
     
     app_state['is_listening'] = False
