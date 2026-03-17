@@ -1,32 +1,26 @@
 """
-kernel.py  ·  AIILAKernel  v5.1  (WORKBENCH EDITION)
+kernel.py  ·  AIILAKernel  v5.2  (WORKBENCH EDITION)
 ======================================================
-FIXES OVER v5:
+CHANGES OVER v5.1:
 
-  [FIX 1]  undo() now delegates to circuit_engine.undo() — single undo stack
-  [FIX 2]  _push_undo() delegates to circuit_engine.snapshot() — works
-  [FIX 3]  hit_test() call passes radius_multiplier kwarg properly
-  [FIX 4]  Wire-draw mode uses nearest_pin_with_info() — records exact
-           GPIO pin name, not hardcoded 'out'/'in'
-  [FIX 5]  Wire drag shows live preview via circuit_engine.start_wire() /
-           extend_wire() — you see the wire forming as you drag your finger
-  [FIX 6]  _hand_lost() cancels wire_in_progress on circuit_engine too
-  [FIX 7]  set_selected_tool() validates against CATALOG at import time,
-           not with a dynamic re-import on every call
-  [FIX 8]  Gesture debounce uses time.monotonic() consistently
-  [FIX 9]  Drag drop re-routes attached wires via _reroute_component_wires()
-  [FIX 10] Wire-draw HUD shows src_pin → cursor line so user can see
-           which GPIO they're connecting from
+  [BRIDGE 1]  GestureCircuitBridge imported and instantiated alongside the
+              two existing engines.  bridge.process(events) is called each
+              frame when circuit mode is active; bridge.draw_overlay() paints
+              ghost, dwell-ring and status toast on top of the rendered canvas.
 
-WORKBENCH INTERACTION MODEL:
-  • AR mode 'default'  — pinch-grab-drag components anywhere on table
-  • AR mode 'draw'     — pinch on a pin → drag → release on another pin
-                          draws a named wire (e.g. ESP32.D2 → LED.A)
-  • DWELL on empty     — places selected component
-  • DWELL on component — selects it (shows pin inspector)
-  • CRUMPLE (2-hand)   — deletes component + its wires
-  • PEACE ✌            — cycles through modes
-  • CLAW_ROTATE        — rotates selected component
+  [BRIDGE 2]  SWIPE handler is now context-aware:
+                • UP / DOWN while panel is visible  → panel scroll (bridge)
+                • LEFT / RIGHT  OR  panel hidden    → layer-view navigation
+              This prevents the same swipe from doing two things at once.
+
+  [BRIDGE 3]  DWELL handler is now context-aware:
+                • Cursor inside panel               → bridge handles selection
+                • Cursor on board                   → existing place/select
+              Avoids placing a component while you're just hovering the list.
+
+  [BRIDGE 4]  PEACE handler skips the mode-cycle when circuit engine is
+              active and the cursor is on the board so that quick-place
+              (bridge) works without also changing the AR mode.
 """
 
 from __future__ import annotations
@@ -42,19 +36,20 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-from core.vision_engine  import scan_object
-from core.voice_engine   import (
+from core.vision_engine          import scan_object
+from core.voice_engine           import (
     listen_and_process_command,
     WORKING_MIC_INDEX, WORKING_MIC_NAME,
     SPEAKER_NAME, SPEAKER_INDEX,
 )
-from core.circuit_engine import CircuitEngine, CATALOG
-from core.gesture_engine import GestureEngine, HAND_CONNECTIONS, GestureType
+from core.circuit_engine         import CircuitEngine, CATALOG
+from core.gesture_engine         import GestureEngine, HAND_CONNECTIONS, GestureType
+from core.gesture_circuit_bridge import GestureCircuitBridge          # [BRIDGE 1]
 
 AR_W, AR_H = 1000, 700
 
 _GRAB_HIT_MULTIPLIER = 1.8
-_PIN_WIRE_RADIUS     = 20    # world px — how close finger must be to a pin to start wire
+_PIN_WIRE_RADIUS     = 20
 _DEBOUNCE_MS = {
     GestureType.SWIPE:   400,
     GestureType.CRUMPLE: 800,
@@ -102,41 +97,47 @@ class AIILAKernel:
             canvas_w=AR_W, canvas_h=AR_H,
             ema_alpha=0.55, min_confidence=0.45,
         )
+
+        # [BRIDGE 1] — Bridge lives here; owns no engines, just links them
+        self.bridge = GestureCircuitBridge(
+            self.circuit_engine, canvas_w=AR_W, canvas_h=AR_H)
+
         self.pending_scan = False
 
         # Drag state
-        self._dragging_id:      int | None             = None
-        self._grab_offset_wx:   float                  = 0.0
-        self._grab_offset_wy:   float                  = 0.0
-        self._pinch_cursor_px:  tuple[int, int] | None = None
+        self._dragging_id:      int | None              = None
+        self._grab_offset_wx:   float                   = 0.0
+        self._grab_offset_wy:   float                   = 0.0
+        self._pinch_cursor_px:  tuple[int, int] | None  = None
 
-        # Wire-draw state  [FIX 4]
-        self._wire_src_id:      int | None  = None
-        self._wire_src_pin:     str | None  = None
-        self._wire_src_pt:      tuple | None = None   # world coords of src pin
-        self._wire_drawing:     bool        = False   # live preview active
+        # Wire-draw state
+        self._wire_src_id:      int | None   = None
+        self._wire_src_pin:     str | None   = None
+        self._wire_src_pt:      tuple | None = None
+        self._wire_drawing:     bool         = False
 
-        # Gesture debounce  [FIX 8]
+        # Gesture debounce
         self._last_fired: dict[GestureType, float] = {}
 
+        # [BRIDGE 1] overlay info carried frame-to-frame
+        self._overlay_info: dict = {}
+
     # ─────────────────────────────────────────────────────────────────────────
-    #  Undo  [FIX 1/2] — engine is authoritative
+    #  Undo
     # ─────────────────────────────────────────────────────────────────────────
 
     def _push_undo(self):
-        """Delegate undo snapshot to circuit_engine (single stack)."""
         try:
             self.circuit_engine._push_undo()
         except Exception:
             pass
 
     def undo(self):
-        """Restore previous circuit state."""
         self.circuit_engine.undo()
         self._feedback("↩ UNDO")
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Feedback
+    #  Feedback / debounce
     # ─────────────────────────────────────────────────────────────────────────
 
     def _feedback(self, msg: str):
@@ -144,10 +145,6 @@ class AIILAKernel:
         self.app_state['feedback_log'].append(
             (time.strftime('%H:%M:%S'), msg)
         )
-
-    # ─────────────────────────────────────────────────────────────────────────
-    #  Debounce  [FIX 8]
-    # ─────────────────────────────────────────────────────────────────────────
 
     def _debounced(self, gesture: GestureType) -> bool:
         limit = _DEBOUNCE_MS.get(gesture, 0)
@@ -159,6 +156,16 @@ class AIILAKernel:
             return True
         self._last_fired[gesture] = now
         return False
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Helpers — panel context
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _cursor_in_panel(self, cursor: tuple[int, int]) -> bool:
+        """True when the screen cursor is over the component panel."""
+        return (self.app_state['circuit_engine_enabled']
+                and self.circuit_engine.panel_visible
+                and self.circuit_engine.in_panel(cursor[0], cursor[1]))
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Main loop
@@ -225,8 +232,18 @@ class AIILAKernel:
 
                 for ev in events:
                     self._route(ev)
+
+                # [BRIDGE 1] — Let bridge process panel/board interactions
+                # after _route so kernel-owned state (selected_id, mode) is
+                # already up to date when the bridge reads it.
+                if self.app_state['circuit_engine_enabled']:
+                    self._overlay_info = self.bridge.process(events)
+                else:
+                    self._overlay_info = {}
+
             else:
                 self._hand_lost()
+                self._overlay_info = {}
 
             if self.pending_scan:
                 self.perform_scan(frame)
@@ -239,7 +256,11 @@ class AIILAKernel:
                 self.circuit_engine.render(ar_canvas)
                 self._draw_placement_preview(ar_canvas)
                 self._draw_pinch_cursor(ar_canvas)
-                self._draw_wire_draw_hud(ar_canvas)   # [FIX 10]
+                self._draw_wire_draw_hud(ar_canvas)
+
+                # [BRIDGE 1] — Paint ghost, dwell ring and status toast
+                if self._overlay_info:
+                    self.bridge.draw_overlay(ar_canvas, self._overlay_info)
 
             self._draw_hud(ar_canvas)
 
@@ -263,7 +284,6 @@ class AIILAKernel:
         self.app_state['dwell_progress']     = 0.0
         self._dragging_id                    = None
         self._pinch_cursor_px                = None
-        # [FIX 6] cancel any in-progress wire
         self._cancel_wire_draw()
 
     def _cancel_wire_draw(self):
@@ -297,7 +317,8 @@ class AIILAKernel:
         if gesture:
             label = f"{str(gesture).upper()}  {conf:.0%}"
             cv2.putText(canvas, label, (12, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 220, 120), 2, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 220, 120), 2,
+                        cv2.LINE_AA)
 
         fingers = self.app_state.get('fingers_state', [False] * 5)
         names   = ['T', 'I', 'M', 'R', 'P']
@@ -307,7 +328,8 @@ class AIILAKernel:
             colour = (0, 220, 100) if ext else (50, 50, 50)
             cv2.circle(canvas, (x, y), 10, colour, -1, cv2.LINE_AA)
             cv2.putText(canvas, name, (x - 5, y + 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1,
+                        cv2.LINE_AA)
 
         prog = self.app_state.get('dwell_progress', 0.0)
         if 0 < prog < 1.0:
@@ -316,7 +338,7 @@ class AIILAKernel:
             cv2.ellipse(canvas, (cx, cy), (40, 40), -90, 0,
                         int(prog * 360), (80, 200, 255), 3)
 
-        ar_mode = self.app_state.get('ar_mode', 'default')
+        ar_mode  = self.app_state.get('ar_mode', 'default')
         mode_col = {
             'default': (180, 180, 60),
             'draw':    (0, 200, 255),
@@ -324,8 +346,8 @@ class AIILAKernel:
             'measure': (255, 120, 0),
         }
         mc = mode_col.get(ar_mode, (180, 180, 60))
-        badge = f"AR:{ar_mode.upper()}"
-        cv2.putText(canvas, badge, (canvas.shape[1] - 150, 22),
+        cv2.putText(canvas, f"AR:{ar_mode.upper()}",
+                    (canvas.shape[1] - 150, 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.52, mc, 1, cv2.LINE_AA)
 
         dyn = self.app_state.get('dynamic_ar_text', '')
@@ -333,13 +355,13 @@ class AIILAKernel:
             tw, _ = cv2.getTextSize(dyn, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)[:2]
             cx2   = (canvas.shape[1] - tw[0]) // 2
             cv2.putText(canvas, dyn, (cx2, 56),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 60), 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 60), 1,
+                        cv2.LINE_AA)
 
     def _draw_pinch_cursor(self, canvas: np.ndarray):
         if not self.app_state['is_pinching'] or self._pinch_cursor_px is None:
             return
         cx, cy = self._pinch_cursor_px
-
         cv2.circle(canvas, (cx, cy), 14, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.circle(canvas, (cx, cy),  5, (0, 220, 120),  -1, cv2.LINE_AA)
 
@@ -352,7 +374,6 @@ class AIILAKernel:
 
         sx, sy = self.circuit_engine.to_screen(comp.x, comp.y)
         cv2.line(canvas, (cx, cy), (sx, sy), (255, 220, 0), 1, cv2.LINE_AA)
-
         hw, hh = 30, 16
         cv2.rectangle(canvas, (sx - hw, sy - hh), (sx + hw, sy + hh),
                       (0, 220, 255), 2, cv2.LINE_AA)
@@ -370,18 +391,13 @@ class AIILAKernel:
                        cv2.MARKER_CROSS, 12, 1, cv2.LINE_AA)
 
     def _draw_wire_draw_hud(self, canvas: np.ndarray):
-        """
-        [FIX 10] Visual overlay while drawing a wire in 'draw' mode.
-        Shows: source pin label, dashed line to cursor, instruction text.
-        """
         if not self._wire_drawing or self._wire_src_pt is None:
             return
 
-        ce  = self.circuit_engine
-        src_sx, src_sy = ce.to_screen(*self._wire_src_pt)
-        cx, cy = self._pinch_cursor_px or (src_sx, src_sy)
+        ce              = self.circuit_engine
+        src_sx, src_sy  = ce.to_screen(*self._wire_src_pt)
+        cx, cy          = self._pinch_cursor_px or (src_sx, src_sy)
 
-        # Dashed line from source pin to finger
         dx, dy = cx - src_sx, cy - src_sy
         length = max(1, math.hypot(dx, dy))
         steps  = int(length / 12)
@@ -392,30 +408,28 @@ class AIILAKernel:
             p1 = (int(src_sx + dx * t1), int(src_sy + dy * t1))
             cv2.line(canvas, p0, p1, (0, 212, 255), 2, cv2.LINE_AA)
 
-        # Source pin marker
         cv2.circle(canvas, (src_sx, src_sy), 8, (255, 210, 0), 2, cv2.LINE_AA)
 
-        # Labels
-        font = cv2.FONT_HERSHEY_SIMPLEX
+        font     = cv2.FONT_HERSHEY_SIMPLEX
         src_comp = ce.get_component(self._wire_src_id)
         if src_comp and self._wire_src_pin:
             lbl = f"{src_comp.label}.{self._wire_src_pin}"
             cv2.putText(canvas, lbl, (src_sx + 10, src_sy - 10),
                         font, 0.45, (255, 210, 0), 1, cv2.LINE_AA)
 
-        # Instruction
-        instr = "Release on target pin to connect"
-        cv2.putText(canvas, instr, (12, canvas.shape[0] - 40),
+        cv2.putText(canvas, "Release on target pin to connect",
+                    (12, canvas.shape[0] - 40),
                     font, 0.45, (0, 200, 255), 1, cv2.LINE_AA)
 
-        # Highlight nearby pins the cursor is close to
-        wx, wy = ce.to_world(cx, cy)
-        pin_info = ce.nearest_pin_with_info(wx, wy, threshold=_PIN_WIRE_RADIUS * 2)
+        wx, wy   = ce.to_world(cx, cy)
+        pin_info = ce.nearest_pin_with_info(wx, wy,
+                                            threshold=_PIN_WIRE_RADIUS * 2)
         if pin_info and pin_info[0].id != self._wire_src_id:
             comp2, pname, pt = pin_info
             ps = ce.to_screen(*pt)
             cv2.circle(canvas, ps, 10, (0, 255, 120), 2, cv2.LINE_AA)
-            cv2.putText(canvas, f"{comp2.label}.{pname}", (ps[0] + 8, ps[1] - 8),
+            cv2.putText(canvas, f"{comp2.label}.{pname}",
+                        (ps[0] + 8, ps[1] - 8),
                         font, 0.4, (0, 255, 120), 1, cv2.LINE_AA)
 
     def _draw_placement_preview(self, canvas: np.ndarray):
@@ -433,7 +447,7 @@ class AIILAKernel:
             self.circuit_engine.snap(wx),
             self.circuit_engine.snap(wy),
         )
-        hw, hh = 28, 14
+        hw, hh  = 28, 14
         overlay = canvas.copy()
         cv2.rectangle(overlay, (sx - hw, sy - hh), (sx + hw, sy + hh),
                       (100, 100, 100), 1)
@@ -441,7 +455,8 @@ class AIILAKernel:
         cv2.putText(canvas,
                     self.app_state['selected_tool'].upper(),
                     (sx - hw, sy - hh - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, (160, 160, 160), 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, (160, 160, 160), 1,
+                    cv2.LINE_AA)
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Gesture routing
@@ -457,8 +472,23 @@ class AIILAKernel:
         self.app_state['cursor_wx'] = wx
         self.app_state['cursor_wy'] = wy
 
+        in_panel = self._cursor_in_panel(cursor)   # convenience flag
+
         # ── PINCH ──────────────────────────────────────────────────────────
         if g == GestureType.PINCH:
+            # [BRIDGE 2] Bridge owns all panel pinch interactions.
+            # _route only handles board-level pinch (wire-draw and component drag).
+            if in_panel:
+                # Keep is_pinching in sync so HUD is correct, then return —
+                # bridge.process() will take care of the panel grab/drag/drop.
+                state = data.get('state')
+                if state == 'grab':
+                    self.app_state['is_pinching'] = True
+                elif state == 'release':
+                    self.app_state['is_pinching'] = False
+                self._pinch_cursor_px = cursor
+                return
+
             self._pinch_cursor_px = cursor
             state = data.get('state')
 
@@ -466,10 +496,7 @@ class AIILAKernel:
                 self.app_state['is_pinching'] = True
 
                 if self.app_state['circuit_engine_enabled']:
-
                     if self.app_state['ar_mode'] == 'draw':
-                        # ── WIRE-DRAW MODE: try to start from nearest pin ──
-                        # [FIX 4] Use nearest_pin_with_info for exact named pin
                         pin_info = self.circuit_engine.nearest_pin_with_info(
                             wx, wy, threshold=_PIN_WIRE_RADIUS)
                         if pin_info:
@@ -478,37 +505,29 @@ class AIILAKernel:
                             self._wire_src_pin = pin_name
                             self._wire_src_pt  = pt
                             self._wire_drawing = True
-                            # Start live wire preview
                             self.circuit_engine.start_wire(pt[0], pt[1])
                             self._feedback(
                                 f"🔌 WIRE from {comp.label}.{pin_name}")
                         else:
-                            # No pin nearby — fall back to grab
                             self._try_grab(wx, wy)
-
                     else:
-                        # ── DEFAULT MODE: grab component ──
                         self._try_grab(wx, wy)
 
             elif state in ('drag', 'holding'):
                 self.app_state['is_pinching'] = True
 
                 if self.app_state['circuit_engine_enabled']:
-
                     if self._wire_drawing and state == 'drag':
-                        # Extend live wire preview
                         self.circuit_engine.extend_wire(wx, wy)
                         self.circuit_engine.mouse_world = (wx, wy)
-
-                    elif (self._dragging_id is not None and state == 'drag'):
-                        # Move grabbed component
-                        comp = self.circuit_engine.get_component(self._dragging_id)
+                    elif self._dragging_id is not None and state == 'drag':
+                        comp = self.circuit_engine.get_component(
+                            self._dragging_id)
                         if comp:
-                            new_x = self.circuit_engine.snap(wx + self._grab_offset_wx)
-                            new_y = self.circuit_engine.snap(wy + self._grab_offset_wy)
-                            comp.x = new_x
-                            comp.y = new_y
-                            # [FIX 9] Re-route attached wires in real time
+                            comp.x = self.circuit_engine.snap(
+                                wx + self._grab_offset_wx)
+                            comp.y = self.circuit_engine.snap(
+                                wy + self._grab_offset_wy)
                             self.circuit_engine._reroute_component_wires(
                                 self._dragging_id)
 
@@ -520,23 +539,22 @@ class AIILAKernel:
                 self.app_state['is_pinching'] = False
 
                 if self.app_state['circuit_engine_enabled']:
-
                     if self._wire_drawing:
-                        # ── Finish wire: snap to nearest pin on release ──
                         pin_info = self.circuit_engine.nearest_pin_with_info(
                             wx, wy, threshold=_PIN_WIRE_RADIUS * 1.5)
                         if pin_info and pin_info[0].id != self._wire_src_id:
                             dst_comp, dst_pin, _ = pin_info
-                            self.circuit_engine.cancel_wire()  # discard preview
+                            self.circuit_engine.cancel_wire()
                             result = self.circuit_engine.add_wire(
                                 self._wire_src_id, self._wire_src_pin,
                                 dst_comp.id, dst_pin,
                             )
                             if result:
+                                src_c = self.circuit_engine.get_component(
+                                    self._wire_src_id)
                                 self._feedback(
-                                    f"✅ {self.circuit_engine.get_component(self._wire_src_id).label}"
-                                    f".{self._wire_src_pin} → "
-                                    f"{dst_comp.label}.{dst_pin}")
+                                    f"✅ {src_c.label}.{self._wire_src_pin}"
+                                    f" → {dst_comp.label}.{dst_pin}")
                             else:
                                 self._feedback("⚠ Wire failed")
                         else:
@@ -545,10 +563,13 @@ class AIILAKernel:
                         self._cancel_wire_draw()
 
                     elif self._dragging_id is not None:
-                        comp = self.circuit_engine.get_component(self._dragging_id)
+                        comp = self.circuit_engine.get_component(
+                            self._dragging_id)
                         if comp:
-                            comp.x = self.circuit_engine.snap(wx + self._grab_offset_wx)
-                            comp.y = self.circuit_engine.snap(wy + self._grab_offset_wy)
+                            comp.x = self.circuit_engine.snap(
+                                wx + self._grab_offset_wx)
+                            comp.y = self.circuit_engine.snap(
+                                wy + self._grab_offset_wy)
                             self.circuit_engine._reroute_component_wires(
                                 self._dragging_id)
 
@@ -563,12 +584,24 @@ class AIILAKernel:
             if self._debounced(GestureType.SWIPE):
                 return
             direction = data['direction']
+
+            # [BRIDGE 2] UP/DOWN while panel visible → panel scroll (bridge
+            # handles it via bridge.process()).  Only navigate layers for
+            # LEFT/RIGHT, or when the panel is hidden.
+            if (self.app_state['circuit_engine_enabled']
+                    and self.circuit_engine.panel_visible
+                    and direction in ('up', 'down')):
+                # Bridge will call panel_scroll_by(); nothing to do here.
+                return
+
             layer = self.app_state['current_layer_view']
-            layer += {'left': 1, 'right': -1, 'down': 1, 'up': -1}.get(direction, 0)
+            layer += {'left': 1, 'right': -1,
+                      'down': 1, 'up':   -1}.get(direction, 0)
             layer = max(1, layer)
             self.app_state['current_layer_view'] = layer
             self.app_state['dynamic_ar_text']    = f"Page {layer}"
-            self._feedback(f"⟵⟶ SWIPE {direction.upper()}  PAGE {layer}")
+            self._feedback(
+                f"⟵⟶ SWIPE {direction.upper()}  PAGE {layer}")
 
         # ── CRUMPLE ────────────────────────────────────────────────────────
         elif g == GestureType.CRUMPLE:
@@ -601,7 +634,9 @@ class AIILAKernel:
             direction = data.get('direction', '')
             self.app_state['ar_rotation'] = (
                 self.app_state['ar_rotation'] + delta) % 360
-            self._feedback(f"↻ ROTATE {direction.upper()} {self.app_state['ar_rotation']:.1f}°")
+            self._feedback(
+                f"↻ ROTATE {direction.upper()}"
+                f" {self.app_state['ar_rotation']:.1f}°")
             if self.app_state['circuit_engine_enabled']:
                 sel = self.circuit_engine.selected_id
                 if sel is not None:
@@ -625,37 +660,49 @@ class AIILAKernel:
         elif g == GestureType.DWELL:
             prog = data.get('progress', 0.0)
             self.app_state['dwell_progress'] = prog
-            if prog >= 1.0:
-                if self.app_state['circuit_engine_enabled']:
-                    hit = self.circuit_engine.hit_test(wx, wy)
-                    if hit:
-                        self.circuit_engine.selected_id = hit.id
-                        self._feedback(f"● SELECTED {hit.type_id.upper()}")
-                    else:
-                        comp = self.circuit_engine.add_component(
-                            self.app_state['selected_tool'], wx, wy)
-                        if comp:
-                            self.circuit_engine.selected_id = comp.id
-                            self._feedback(f"✚ PLACED {comp.type_id.upper()}")
+
+            # [BRIDGE 3] If cursor is over the panel, bridge handles the
+            # hover-highlight and eventual selection — skip board logic.
+            if in_panel:
+                return
+
+            if prog >= 1.0 and self.app_state['circuit_engine_enabled']:
+                hit = self.circuit_engine.hit_test(wx, wy)
+                if hit:
+                    self.circuit_engine.selected_id = hit.id
+                    self._feedback(f"● SELECTED {hit.type_id.upper()}")
                 else:
-                    self._feedback("● DWELL")
+                    comp = self.circuit_engine.add_component(
+                        self.app_state['selected_tool'], wx, wy)
+                    if comp:
+                        self.circuit_engine.selected_id = comp.id
+                        self._feedback(f"✚ PLACED {comp.type_id.upper()}")
+            elif prog >= 1.0:
+                self._feedback("● DWELL")
 
         # ── PEACE ──────────────────────────────────────────────────────────
         elif g == GestureType.PEACE:
+            # [BRIDGE 4] When circuit mode is on and cursor is on the board,
+            # bridge handles quick-place ✌ → mode-cycle is skipped so the
+            # user doesn't accidentally switch modes while placing parts.
+            if (self.app_state['circuit_engine_enabled']
+                    and not in_panel):
+                return   # bridge.process() fires quick-place
+
             if self._debounced(GestureType.PEACE):
                 return
             modes = ['default', 'draw', 'inspect', 'measure']
             cur   = self.app_state.get('ar_mode', 'default')
-            nxt   = modes[(modes.index(cur) + 1) % len(modes)] if cur in modes else 'default'
+            nxt   = (modes[(modes.index(cur) + 1) % len(modes)]
+                     if cur in modes else 'default')
             self.app_state['ar_mode'] = nxt
             self._feedback(f"✌ MODE → {nxt.upper()}")
 
     # ─────────────────────────────────────────────────────────────────────────
 
     def _try_grab(self, wx: float, wy: float):
-        """Attempt to grab a component at world coords (wx,wy)."""
         hit = self.circuit_engine.hit_test(
-            wx, wy, radius_multiplier=_GRAB_HIT_MULTIPLIER)  # [FIX 3]
+            wx, wy, radius_multiplier=_GRAB_HIT_MULTIPLIER)
         if hit:
             self.circuit_engine.selected_id = hit.id
             self._dragging_id    = hit.id
@@ -700,7 +747,6 @@ class AIILAKernel:
         self._feedback("[CIRCUIT] ON" if enabled else "[CIRCUIT] OFF")
 
     def set_selected_tool(self, type_id: str):
-        """[FIX 7] Validates against module-level CATALOG, no dynamic import."""
         if type_id in CATALOG:
             self.app_state['selected_tool'] = type_id
         else:
