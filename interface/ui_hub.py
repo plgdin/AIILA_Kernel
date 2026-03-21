@@ -19,16 +19,29 @@ import multiprocessing as mp
 import time
 import numpy as np
 
-from PyQt6.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QFrame, QLabel
+from PyQt6.QtWidgets import (
+    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QFrame, QLabel
+)
 from PyQt6.QtGui  import QKeySequence, QShortcut
 from PyQt6.QtCore import Qt, QTimer
 
+from core.app_defaults import DEFAULT_KEYBINDS
 from interface.settings_panel import SettingsPanel
 from interface.ui_styles import C, _SS_BASE
 from interface.ui_utils import _ndarray_to_pixmap
 from interface.ui_workers import _image_worker
 from interface.ui_widgets import Sidebar, Viewport, StatusBar
 from interface.ui_projector import ProjectorWindow
+
+
+SHORTCUT_BUTTONS = {
+    'scan_unit': 'SCAN UNIT',
+    'activate_aiila': 'ACTIVATE AIILA',
+    'circuit_mode': 'CIRCUIT MODE',
+    'wire_draw_mode': 'WIRE DRAW MODE',
+    'run_simulation': 'RUN SIMULATION',
+    'project_to_screen': 'PROJECT TO SCREEN',
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -43,6 +56,8 @@ class UIHub(QMainWindow):
         self.calibration_mode = False
         self._circuit_active  = False
         self._sim_active      = False
+        self._action_shortcuts: dict[str, QShortcut] = {}
+        self._shutting_down   = False
 
         self._in_q  = mp.Queue(maxsize=2)
         self._out_q = mp.Queue(maxsize=2)
@@ -57,6 +72,7 @@ class UIHub(QMainWindow):
 
         self.setWindowTitle("AIILA OS — NEURAL INTERFACE TERMINAL  v2.4.1")
         self.setGeometry(80, 60, 1600, 920)
+        self.setMinimumSize(1180, 760)
         self.setStyleSheet(_SS_BASE)
 
         self._build_ui()
@@ -89,14 +105,26 @@ class UIHub(QMainWindow):
 
         body = QWidget()
         body_lay = QHBoxLayout(body)
-        body_lay.setContentsMargins(0, 0, 0, 0)
-        body_lay.setSpacing(0)
+        body_lay.setContentsMargins(8, 8, 8, 8)
+        body_lay.setSpacing(10)
 
         self.sidebar  = Sidebar(self.kernel)
         body_lay.addWidget(self.sidebar)
 
+        viewport_shell = QFrame()
+        viewport_shell.setStyleSheet(
+            f"background:{C['surface']};"
+            f"border:1px solid {C['border']};"
+            f"border-left:1px solid {C['border_hi']};"
+        )
+        viewport_lay = QVBoxLayout(viewport_shell)
+        viewport_lay.setContentsMargins(10, 10, 10, 10)
+        viewport_lay.setSpacing(0)
+
         self.viewport = Viewport()
-        body_lay.addWidget(self.viewport, 1)
+        self.viewport.setMinimumSize(760, 520)
+        viewport_lay.addWidget(self.viewport, 1)
+        body_lay.addWidget(viewport_shell, 1)
 
         outer.addWidget(body, 1)
 
@@ -119,6 +147,52 @@ class UIHub(QMainWindow):
         undo_sc = QShortcut(QKeySequence("Ctrl+Z"), self)
         undo_sc.activated.connect(self._on_undo)
 
+        self.refresh_shortcuts()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.width() < 1280 and self.sidebar.is_expanded:
+            self.sidebar.close_panel()
+
+    def _ensure_keybind_state(self) -> dict:
+        keybinds = self.kernel.app_state.setdefault('keybinds', {})
+        for action, default in DEFAULT_KEYBINDS.items():
+            keybinds.setdefault(action, default)
+        return keybinds
+
+    def _set_button_shortcuts(self, keybinds: dict):
+        self.sidebar.btn_scan.set_label(
+            f"{SHORTCUT_BUTTONS['scan_unit']} [{keybinds['scan_unit']}]")
+        self.sidebar.btn_voice.set_label(
+            f"{SHORTCUT_BUTTONS['activate_aiila']} [{keybinds['activate_aiila']}]")
+        self.sidebar.btn_circuit.set_label(
+            f"{SHORTCUT_BUTTONS['circuit_mode']} [{keybinds['circuit_mode']}]")
+        self.sidebar.btn_draw.set_label(
+            f"{SHORTCUT_BUTTONS['wire_draw_mode']} [{keybinds['wire_draw_mode']}]")
+        self.sidebar.btn_sim.set_label(
+            f"{SHORTCUT_BUTTONS['run_simulation']} [{keybinds['run_simulation']}]")
+        self.sidebar.btn_project.set_label(
+            f"{SHORTCUT_BUTTONS['project_to_screen']} [{keybinds['project_to_screen']}]")
+
+    def _bind_shortcut(self, action: str, sequence: str, handler):
+        shortcut = self._action_shortcuts.get(action)
+        if shortcut is None:
+            shortcut = QShortcut(QKeySequence(), self)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(handler)
+            self._action_shortcuts[action] = shortcut
+        shortcut.setKey(QKeySequence(sequence))
+
+    def refresh_shortcuts(self):
+        keybinds = self._ensure_keybind_state()
+        self._set_button_shortcuts(keybinds)
+        self._bind_shortcut('scan_unit', keybinds['scan_unit'], self._on_scan)
+        self._bind_shortcut('activate_aiila', keybinds['activate_aiila'], self._on_voice)
+        self._bind_shortcut('circuit_mode', keybinds['circuit_mode'], self._toggle_circuit)
+        self._bind_shortcut('wire_draw_mode', keybinds['wire_draw_mode'], self._toggle_draw_mode)
+        self._bind_shortcut('run_simulation', keybinds['run_simulation'], self._toggle_sim)
+        self._bind_shortcut('project_to_screen', keybinds['project_to_screen'], self._toggle_projector)
+
     def _loop(self):
         self._clock.setText(time.strftime("  %Y-%m-%d   %H:%M:%S  "))
 
@@ -139,11 +213,13 @@ class UIHub(QMainWindow):
                 p_rgb, ar_rgb, cam_rgb, state = data
 
                 if self.projector_window:
+                    exploded_view = self.kernel.exploded_view_engine.get_view_state()
                     self.projector_window.update_display(
                         p_rgb,
                         self.kernel.circuit_engine if self._circuit_active else None,
                         self._circuit_active,
                         ar_mode=state.get('ar_mode', 'default'),
+                        exploded_view=exploded_view,
                     )
 
                 self.viewport.set_frame(_ndarray_to_pixmap(ar_rgb))
@@ -177,7 +253,7 @@ class UIHub(QMainWindow):
 
     def _on_voice(self):
         self.kernel.trigger_voice()
-        self.sidebar.terminal.push("Voice listener activated", "SYS")
+        self.sidebar.terminal.push("AIILA voice listener activated", "SYS")
 
     def _toggle_circuit(self):
         self._circuit_active = not self._circuit_active
@@ -249,6 +325,42 @@ class UIHub(QMainWindow):
         self._settings_dlg = SettingsPanel(self, self.kernel.app_state, self.kernel)
         self._settings_dlg.show()
 
+    def shutdown(self):
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+
+        try:
+            self._timer.stop()
+        except Exception:
+            pass
+
+        self.kernel.running = False
+
+        if self.projector_window is not None:
+            try:
+                self.projector_window.close()
+            except Exception:
+                pass
+            self.projector_window = None
+
+        try:
+            if self._worker.is_alive():
+                self._worker.terminate()
+                self._worker.join(timeout=1500/1000)
+        except Exception:
+            pass
+
+        for queue in (self._in_q, self._out_q):
+            try:
+                queue.close()
+            except Exception:
+                pass
+            try:
+                queue.cancel_join_thread()
+            except Exception:
+                pass
+
     def closeEvent(self, event):
-        self._worker.terminate()
+        self.shutdown()
         event.accept()

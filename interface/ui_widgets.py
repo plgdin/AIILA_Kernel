@@ -68,9 +68,19 @@ class HexButton(QPushButton):
     """
 
     def __init__(self, text: str, prefix: str = "▸", parent=None):
-        super().__init__(f"  {prefix}  {text}", parent)
+        super().__init__(parent)
+        self._prefix = prefix
+        self._label = text
+        self._apply_text()
         self.setStyleSheet(self._NORMAL)
         self._active = False
+
+    def _apply_text(self):
+        self.setText(f"  {self._prefix}  {self._label}")
+
+    def set_label(self, text: str):
+        self._label = text
+        self._apply_text()
 
     def set_active(self, on: bool):
         self._active = on
@@ -382,7 +392,7 @@ class Sidebar(QFrame):
     """
 
     NOTCH_W = 28
-    FULL_W  = 300
+    FULL_W  = 280
     ANIM_MS = 260
 
     def __init__(self, kernel, parent=None):
@@ -393,6 +403,8 @@ class Sidebar(QFrame):
         # Animation on maximumWidth
         self.setMinimumWidth(self.NOTCH_W)
         self.setMaximumWidth(self.NOTCH_W)     # start collapsed
+        self.setSizePolicy(QSizePolicy.Policy.Fixed,
+                           QSizePolicy.Policy.Expanding)
         self.setStyleSheet(f"""
             QFrame {{
                 background: {C['surface']};
@@ -432,6 +444,10 @@ class Sidebar(QFrame):
 
         self._build_content(self._content_w)
         root.addWidget(self._content_w)
+
+    @property
+    def is_expanded(self) -> bool:
+        return self._expanded
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Drag-to-close on the panel body
@@ -606,7 +622,7 @@ class Sidebar(QFrame):
         btn_lay.setSpacing(3)
 
         self.btn_scan     = HexButton("SCAN UNIT",         "⊕")
-        self.btn_voice    = HexButton("ACTIVATE JARVIS",   "◉")
+        self.btn_voice    = HexButton("ACTIVATE AIILA",    "◉")
         self.btn_circuit  = HexButton("CIRCUIT MODE",      "⎔")
         self.btn_draw     = HexButton("WIRE DRAW MODE",    "⌁")
         self.btn_sim      = HexButton("RUN SIMULATION",    "▶")

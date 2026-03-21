@@ -60,7 +60,7 @@ def get_speaker_info():
 WORKING_MIC_INDEX, WORKING_MIC_NAME = initialize_mic()
 SPEAKER_NAME, SPEAKER_INDEX = get_speaker_info()
 
-def listen_and_process_command(app_state):
+def listen_and_process_command(app_state, command_handler=None):
     """Processes voice input and updates AR state using Gemini 2.0."""
     if app_state.get('mic_index') is None and WORKING_MIC_INDEX is None:
         app_state['voice_feedback'] = "System: No Microphone Hardware!"
@@ -80,6 +80,10 @@ def listen_and_process_command(app_state):
             
             app_state['voice_feedback'] = "Processing Speech..."
             user_text = recognizer.recognize_google(audio)
+            app_state['dynamic_ar_text'] = user_text
+
+            if command_handler is not None and command_handler(user_text):
+                return
             
             # Contextual Prompt for A.E.G.I.S. / AIILA
             model_context = app_state.get('active_model', 'General System')
@@ -116,5 +120,5 @@ def listen_and_process_command(app_state):
         import traceback
         traceback.print_exc()
         app_state['voice_feedback'] = f"System Error: {str(e)}"
-    
-    app_state['is_listening'] = False
+    finally:
+        app_state['is_listening'] = False

@@ -61,10 +61,11 @@ class ProjectorWindow(QWidget):
         self._circuit_engine  = None
         self._circuit_active  = False
         self._ar_mode         = 'default'
+        self._exploded_view   = None
 
     def update_display(self, ar_rgb: np.ndarray | None,
                        circuit_engine=None, circuit_active: bool = False,
-                       ar_mode: str = 'default'):
+                       ar_mode: str = 'default', exploded_view: dict | None = None):
         elapsed = time.time() - self._t0
         if self._phase == "BOOT"  and elapsed > 2.2:
             self._phase = "INTRO"
@@ -74,6 +75,7 @@ class ProjectorWindow(QWidget):
         self._circuit_engine = circuit_engine
         self._circuit_active = circuit_active
         self._ar_mode        = ar_mode
+        self._exploded_view  = exploded_view or {}
 
         frame = np.zeros((self.H, self.W, 3), dtype=np.uint8)
         self._draw_background(frame, elapsed)
@@ -85,7 +87,8 @@ class ProjectorWindow(QWidget):
         else:
             d = min(1.0, (elapsed - 4.5) / 1.0)
             self._draw_desktop(frame, elapsed, ar_rgb, d,
-                               self._circuit_engine, self._circuit_active)
+                               self._circuit_engine, self._circuit_active,
+                               self._exploded_view)
 
         if self._phase != "BOOT":
             self._draw_topbar(frame, elapsed)
@@ -217,7 +220,8 @@ class ProjectorWindow(QWidget):
                 cv2.line(f, (spacing * i, TY + 6), (spacing * i, self.H - 6),
                          (0, int(30*a), int(40*a)), 1)
 
-    def _draw_desktop(self, f, t, ar_rgb, d, circuit_engine, circuit_active):
+    def _draw_desktop(self, f, t, ar_rgb, d, circuit_engine, circuit_active,
+                      exploded_view=None):
         c   = int(255 * d)
         dim = int(120 * d)
         PAD, TBH = 12, 48
@@ -253,6 +257,10 @@ class ProjectorWindow(QWidget):
         RW = self.W - RX - PAD
         if circuit_active and circuit_engine is not None:
             self._draw_circuit_panel(f, t, d, RX, TBH + PAD, RW, circuit_engine)
+        elif exploded_view and exploded_view.get("visible"):
+            self._draw_exploded_panel(f, d, RX, TBH + PAD, RW, exploded_view)
+            dock_y = TBH + PAD + 545
+            self._draw_app_dock(f, t, d, RX, dock_y, RW)
         else:
             self._draw_metrics(f, t, d, RX, TBH + PAD, RW)
             log_y1 = TBH + PAD + 260
@@ -260,6 +268,79 @@ class ProjectorWindow(QWidget):
             self._draw_kernel_log(f, d, RX, log_y1, RW, log_y2)
             dock_y = TBH + PAD + 545
             self._draw_app_dock(f, t, d, RX, dock_y, RW)
+
+    def _draw_exploded_panel(self, f, d, rx, ry, rw, exploded_view):
+        c = int(255 * d)
+        dim = int(120 * d)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        panel_h = 530
+
+        cv2.rectangle(f, (rx, ry), (rx + rw, ry + panel_h),
+                      (0, int(18 * d), int(26 * d)), -1)
+        cv2.rectangle(f, (rx, ry), (rx + rw, ry + panel_h),
+                      (0, int(110 * d), c), 1)
+        self._corner_brackets(f, rx, ry, rx + rw, ry + panel_h,
+                              (0, int(190 * d), c), 14, 1)
+        cv2.putText(f, "EXPLODED VIEW", (rx + 6, ry - 6),
+                    font, 0.38, (0, dim, dim), 1, cv2.LINE_AA)
+
+        model_name = exploded_view.get("model_name", "") or "SCANNED DEVICE"
+        cv2.putText(f, model_name[:30], (rx + 10, ry + 24),
+                    font, 0.5, (0, int(200 * d), c), 1, cv2.LINE_AA)
+
+        count_text = f"PART {exploded_view.get('index', 0)}/{exploded_view.get('total', 0)}"
+        (tw, _), _ = cv2.getTextSize(count_text, font, 0.42, 1)
+        cv2.putText(f, count_text, (rx + rw - tw - 10, ry + 24),
+                    font, 0.42, (0, int(180 * d), int(230 * d)), 1, cv2.LINE_AA)
+
+        img_x1, img_y1 = rx + 10, ry + 40
+        img_x2, img_y2 = rx + rw - 10, ry + 405
+        cv2.rectangle(f, (img_x1, img_y1), (img_x2, img_y2),
+                      (0, int(48 * d), int(72 * d)), 1)
+
+        img = exploded_view.get("image")
+        if img is not None:
+            target_w = max(1, img_x2 - img_x1 - 2)
+            target_h = max(1, img_y2 - img_y1 - 2)
+            ih, iw = img.shape[:2]
+            scale = min(target_w / max(iw, 1), target_h / max(ih, 1))
+            resized = cv2.resize(
+                img,
+                (max(1, int(iw * scale)), max(1, int(ih * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+            rh, rw2 = resized.shape[:2]
+            px = img_x1 + 1 + (target_w - rw2) // 2
+            py = img_y1 + 1 + (target_h - rh) // 2
+            f[py:py + rh, px:px + rw2] = resized
+        else:
+            cv2.putText(f, "IMAGE NOT AVAILABLE",
+                        (img_x1 + 20, (img_y1 + img_y2) // 2),
+                        font, 0.45, (0, int(90 * d), int(120 * d)), 1, cv2.LINE_AA)
+
+        caption = (exploded_view.get("caption", "") or "").replace("\n", " ").strip()
+        if len(caption) > 90:
+            caption = caption[:87] + "..."
+        cv2.putText(f, caption[:45], (rx + 10, ry + 432),
+                    font, 0.36, (0, int(150 * d), int(170 * d)), 1, cv2.LINE_AA)
+        if len(caption) > 45:
+            cv2.putText(f, caption[45:90], (rx + 10, ry + 452),
+                        font, 0.36, (0, int(150 * d), int(170 * d)), 1, cv2.LINE_AA)
+
+        cv2.putText(f, "SWIPE LEFT/RIGHT  OR  VOICE: NEXT / PREVIOUS / HIDE",
+                    (rx + 10, ry + 485),
+                    font, 0.34, (0, int(200 * d), int(240 * d)), 1, cv2.LINE_AA)
+
+        source_url = exploded_view.get("source_url", "") or ""
+        source_host = ""
+        if source_url:
+            try:
+                source_host = source_url.split("//", 1)[-1].split("/", 1)[0]
+            except Exception:
+                source_host = source_url[:38]
+        if source_host:
+            cv2.putText(f, f"SOURCE  {source_host[:44]}", (rx + 10, ry + 506),
+                        font, 0.33, (0, int(110 * d), int(130 * d)), 1, cv2.LINE_AA)
 
     def _draw_metrics(self, f, t, d, rx, ry, rw):
         c   = int(255 * d)

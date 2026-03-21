@@ -36,6 +36,7 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
+from core.app_defaults          import DEFAULT_KEYBINDS
 from core.vision_engine          import scan_object
 from core.voice_engine           import (
     listen_and_process_command,
@@ -43,6 +44,7 @@ from core.voice_engine           import (
     SPEAKER_NAME, SPEAKER_INDEX,
 )
 from core.circuit_engine         import CircuitEngine, CATALOG
+from core.exploded_view_engine   import ExplodedViewEngine
 from core.gesture_engine         import GestureEngine, HAND_CONNECTIONS, GestureType
 from core.gesture_circuit_bridge import GestureCircuitBridge          # [BRIDGE 1]
 
@@ -90,6 +92,11 @@ class AIILAKernel:
             'dwell_progress':         0.0,
             'cursor_wx':              0.0,
             'cursor_wy':              0.0,
+            'keybinds':               DEFAULT_KEYBINDS.copy(),
+            'exploded_view_visible':  False,
+            'exploded_view_index':    0,
+            'exploded_view_total':    0,
+            'exploded_view_caption':  "",
         }
 
         self.circuit_engine = CircuitEngine(canvas_w=AR_W, canvas_h=AR_H)
@@ -97,6 +104,7 @@ class AIILAKernel:
             canvas_w=AR_W, canvas_h=AR_H,
             ema_alpha=0.55, min_confidence=0.45,
         )
+        self.exploded_view_engine = ExplodedViewEngine()
 
         # [BRIDGE 1] — Bridge lives here; owns no engines, just links them
         self.bridge = GestureCircuitBridge(
@@ -262,6 +270,7 @@ class AIILAKernel:
                 if self._overlay_info:
                     self.bridge.draw_overlay(ar_canvas, self._overlay_info)
 
+            self._draw_exploded_view(ar_canvas)
             self._draw_hud(ar_canvas)
 
             if self.gui_callback:
@@ -357,6 +366,64 @@ class AIILAKernel:
             cv2.putText(canvas, dyn, (cx2, 56),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 60), 1,
                         cv2.LINE_AA)
+
+    def _draw_exploded_view(self, canvas: np.ndarray):
+        view = self.exploded_view_engine.get_view_state()
+        if not view.get('visible'):
+            return
+
+        img = view.get('image')
+        if img is None:
+            return
+
+        pad = 18
+        panel_w = min(420, canvas.shape[1] - pad * 2)
+        panel_h = min(320, canvas.shape[0] - 120)
+        x2 = canvas.shape[1] - pad
+        x1 = x2 - panel_w
+        y1 = 74
+        y2 = y1 + panel_h
+
+        overlay = canvas.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (5, 12, 20), -1)
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 180, 255), 1)
+        cv2.addWeighted(overlay, 0.78, canvas, 0.22, 0, canvas)
+
+        header = f"INTERNAL VIEW  {view['index']}/{view['total']}"
+        cv2.putText(canvas, header, (x1 + 12, y1 + 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 1,
+                    cv2.LINE_AA)
+
+        model_name = view.get('model_name', '')
+        cv2.putText(canvas, model_name[:34], (x1 + 12, y1 + 46),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1,
+                    cv2.LINE_AA)
+
+        img_x1, img_y1 = x1 + 12, y1 + 58
+        img_x2, img_y2 = x2 - 12, y2 - 54
+        target_w = max(1, img_x2 - img_x1)
+        target_h = max(1, img_y2 - img_y1)
+        ih, iw = img.shape[:2]
+        scale = min(target_w / iw, target_h / ih)
+        resized = cv2.resize(img, (max(1, int(iw * scale)), max(1, int(ih * scale))),
+                             interpolation=cv2.INTER_AREA)
+        rh, rw = resized.shape[:2]
+        px = img_x1 + (target_w - rw) // 2
+        py = img_y1 + (target_h - rh) // 2
+        canvas[py:py + rh, px:px + rw] = resized
+        cv2.rectangle(canvas, (img_x1, img_y1), (img_x2, img_y2),
+                      (30, 120, 180), 1)
+
+        caption = (view.get('caption', '') or '').replace('\n', ' ').strip()
+        if len(caption) > 60:
+            caption = caption[:57] + "..."
+        cv2.putText(canvas, caption, (x1 + 12, y2 - 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 230, 235), 1,
+                    cv2.LINE_AA)
+        cv2.putText(canvas, "SWIPE L/R  or  voice: next / previous / hide",
+                    (x1 + 12, y2 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (120, 190, 220), 1,
+                    cv2.LINE_AA)
 
     def _draw_pinch_cursor(self, canvas: np.ndarray):
         if not self.app_state['is_pinching'] or self._pinch_cursor_px is None:
@@ -594,6 +661,14 @@ class AIILAKernel:
                 # Bridge will call panel_scroll_by(); nothing to do here.
                 return
 
+            if self.app_state.get('exploded_view_visible') and direction in ('left', 'right'):
+                moved = (self.next_exploded_view()
+                         if direction == 'left' else
+                         self.previous_exploded_view())
+                if not moved and self.app_state.get('exploded_view_total', 0) <= 1:
+                    self._feedback("⚠ Only one internal image available")
+                return
+
             layer = self.app_state['current_layer_view']
             layer += {'left': 1, 'right': -1,
                       'down': 1, 'up':   -1}.get(direction, 0)
@@ -722,11 +797,121 @@ class AIILAKernel:
     def _on_project(self, velocity: float, direction_vec: list):
         pass
 
+    def _sync_exploded_state(self):
+        view = self.exploded_view_engine.get_view_state()
+        self.app_state['exploded_view_visible'] = bool(view.get('visible'))
+        self.app_state['exploded_view_index'] = int(view.get('index', 0))
+        self.app_state['exploded_view_total'] = int(view.get('total', 0))
+        self.app_state['exploded_view_caption'] = view.get('caption', '') or ""
+
+    def show_exploded_view(self) -> bool:
+        model_name = (self.app_state.get('active_model') or '').strip()
+        if not model_name or model_name in {'unknown', 'error'}:
+            self._feedback("⚠ Scan a supported device first")
+            return False
+
+        self._feedback(f"🧩 Loading internal view for {model_name}...")
+        ok, msg = self.exploded_view_engine.load_for_model(
+            model_name,
+            self.app_state.get('active_category', ''),
+        )
+        self._sync_exploded_state()
+        if ok:
+            self.app_state['dynamic_ar_text'] = (
+                f"INTERNAL VIEW {self.app_state['exploded_view_index']}/"
+                f"{self.app_state['exploded_view_total']}"
+            )
+            self._feedback(msg)
+            return True
+
+        self.app_state['dynamic_ar_text'] = ""
+        self._feedback(msg)
+        return False
+
+    def hide_exploded_view(self) -> bool:
+        if not self.app_state.get('exploded_view_visible'):
+            return False
+        self.exploded_view_engine.clear()
+        self._sync_exploded_state()
+        self.app_state['dynamic_ar_text'] = ""
+        self._feedback("🗂 Internal view closed")
+        return True
+
+    def next_exploded_view(self) -> bool:
+        moved = self.exploded_view_engine.next_image()
+        self._sync_exploded_state()
+        if moved:
+            self.app_state['dynamic_ar_text'] = (
+                f"PART {self.app_state['exploded_view_index']}/"
+                f"{self.app_state['exploded_view_total']}"
+            )
+            self._feedback(
+                f"➡ PART {self.app_state['exploded_view_index']}/"
+                f"{self.app_state['exploded_view_total']}"
+            )
+        return moved
+
+    def previous_exploded_view(self) -> bool:
+        moved = self.exploded_view_engine.previous_image()
+        self._sync_exploded_state()
+        if moved:
+            self.app_state['dynamic_ar_text'] = (
+                f"PART {self.app_state['exploded_view_index']}/"
+                f"{self.app_state['exploded_view_total']}"
+            )
+            self._feedback(
+                f"⬅ PART {self.app_state['exploded_view_index']}/"
+                f"{self.app_state['exploded_view_total']}"
+            )
+        return moved
+
+    def _handle_voice_command(self, text: str) -> bool:
+        cmd = (text or '').strip().lower()
+        if not cmd:
+            return False
+
+        next_words = ("next part", "next image", "show next", "next one", "next internal")
+        prev_words = ("previous part", "prev part", "previous image", "show previous", "go back")
+        hide_words = ("hide exploded", "close exploded", "hide internal", "close internal", "hide parts")
+        show_words = (
+            "show exploded",
+            "exploded view",
+            "exploded image",
+            "internal view",
+            "show internal",
+            "internal parts",
+            "show me inside",
+        )
+
+        if any(word in cmd for word in next_words):
+            if not self.next_exploded_view():
+                self._feedback("⚠ No next internal image")
+            return True
+
+        if any(word in cmd for word in prev_words):
+            if not self.previous_exploded_view():
+                self._feedback("⚠ No previous internal image")
+            return True
+
+        if any(word in cmd for word in hide_words):
+            if not self.hide_exploded_view():
+                self._feedback("⚠ Internal view is not open")
+            return True
+
+        if any(word in cmd for word in show_words):
+            self.show_exploded_view()
+            return True
+
+        return False
+
     def perform_scan(self, frame: np.ndarray):
         self._feedback("🔍 SCANNING...")
         cat, model = scan_object(frame)
+        self.exploded_view_engine.clear()
+        self._sync_exploded_state()
         self.app_state['active_category'] = cat
         self.app_state['active_model']    = model
+        self.app_state['dynamic_ar_text'] = ""
         self._feedback(f"UNIT: {model}")
 
     def trigger_voice(self):
@@ -734,7 +919,7 @@ class AIILAKernel:
             self.app_state['is_listening'] = True
             threading.Thread(
                 target=listen_and_process_command,
-                args=(self.app_state,),
+                args=(self.app_state, self._handle_voice_command),
                 daemon=True,
             ).start()
 

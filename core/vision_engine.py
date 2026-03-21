@@ -39,7 +39,7 @@ def scan_object(frame):
             category, model = ans.split("|", 1)
             print(f"AI Identified Category: {category.strip()}")
             print(f"AI Identified Exact Model: {model.strip()}")
-            return category.strip().lower(), model.strip().title()
+            return category.strip().lower(), model.strip()
         else:
             print(f"AI Raw Answer: {ans}")
             return "unknown", ans.strip()

@@ -1,9 +1,14 @@
 import cv2
 import multiprocessing as mp
+import signal
 
 from interface.ar_overlay import assemble_final_os_view
 
 def _image_worker(in_q: mp.Queue, out_q: mp.Queue):
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except Exception:
+        pass
     while True:
         try:
             ar_canvas, raw_frame, state, proj_active, calib = in_q.get()

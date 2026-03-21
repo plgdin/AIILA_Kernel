@@ -1,17 +1,19 @@
 import sys
+import signal
 import ctypes
 import threading
 import traceback
 import multiprocessing as mp
 
 from PyQt6.QtWidgets import QApplication, QMessageBox
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 
 from interface.ui_hub import UIHub
 from core.main_kernel import AIILAKernel
 
 
 def launch():
+    shutting_down = {'value': False}
 
     # ── DPI awareness (Windows) ───────────────────────────────────────────────
     if sys.platform == 'win32':
@@ -26,6 +28,8 @@ def launch():
 
     # ── Global exception handler — shows a dialog instead of silent crash ────
     def _handle_exception(exc_type, exc_value, exc_tb):
+        if exc_type is KeyboardInterrupt:
+            return
         msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
         print(msg, file=sys.stderr)
         try:
@@ -51,13 +55,47 @@ def launch():
     thread = threading.Thread(target=_run_kernel_safe, args=(kernel,), daemon=True)
     thread.start()
 
-    sys.exit(app.exec())
+    def _shutdown():
+        if shutting_down['value']:
+            return
+        shutting_down['value'] = True
+        window.shutdown()
+        app.quit()
+
+    sigint_pump = QTimer()
+    sigint_pump.setInterval(200)
+    sigint_pump.timeout.connect(lambda: None)
+    sigint_pump.start()
+
+    def _handle_sigint(_signum, _frame):
+        QTimer.singleShot(0, _shutdown)
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+    try:
+        signal.signal(signal.SIGTERM, _handle_sigint)
+    except Exception:
+        pass
+
+    app.aboutToQuit.connect(_shutdown)
+
+    exit_code = app.exec()
+    window.shutdown()
+    thread.join(timeout=2.0)
+    sys.exit(exit_code)
 
 
 def _run_kernel_safe(kernel: AIILAKernel):
     """Wraps kernel.run() so a crash in the background thread is printed clearly."""
     try:
         kernel.run()
+    except KeyboardInterrupt:
+        kernel.running = False
+    except RuntimeError as exc:
+        if (not kernel.running
+                and "cannot schedule new futures after shutdown" in str(exc)):
+            return
+        traceback.print_exc()
+        kernel.running = False
     except Exception:
         traceback.print_exc()
         kernel.running = False   # stop the loop cleanly on error
