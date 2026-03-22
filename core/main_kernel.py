@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import re
 import threading
 import time
 import math
@@ -79,6 +80,7 @@ class AIILAKernel:
             'selected_tool':          'resistor',
             'is_pinching':            False,
             'circuit_engine_enabled': False,
+            'simulation_running':     False,
             'camera_index':           0,
             'mic_index':              WORKING_MIC_INDEX,
             'mic_name':               WORKING_MIC_NAME,
@@ -86,6 +88,8 @@ class AIILAKernel:
             'speaker_name':           SPEAKER_NAME,
             'ar_rotation':            0.0,
             'ar_mode':                'default',
+            'projector_enabled':      False,
+            'calibration_mode':       False,
             'gesture_active':         None,
             'gesture_confidence':     0.0,
             'fingers_state':          [False] * 5,
@@ -97,6 +101,7 @@ class AIILAKernel:
             'exploded_view_index':    0,
             'exploded_view_total':    0,
             'exploded_view_caption':  "",
+            'ui_command_request':     None,
         }
 
         self.circuit_engine = CircuitEngine(canvas_w=AR_W, canvas_h=AR_H)
@@ -865,14 +870,59 @@ class AIILAKernel:
             )
         return moved
 
+    def set_page(self, page: int) -> bool:
+        page = max(1, int(page))
+        self.app_state['current_layer_view'] = page
+        self.app_state['dynamic_ar_text'] = f"Page {page}"
+        self._feedback(f"PAGE {page}")
+        return True
+
+    def shift_page(self, delta: int) -> bool:
+        current = int(self.app_state.get('current_layer_view', 1))
+        return self.set_page(current + delta)
+
+    def request_ui_command(self, command: str):
+        self.app_state['ui_command_request'] = command
+
     def _handle_voice_command(self, text: str) -> bool:
         cmd = (text or '').strip().lower()
         if not cmd:
             return False
 
+        settings_words = (
+            "open settings",
+            "open hardware settings",
+            "hardware settings",
+            "settings panel",
+        )
+        scan_words = (
+            "scan unit",
+            "scan object",
+            "scan device",
+            "scan now",
+        )
         next_words = ("next part", "next image", "show next", "next one", "next internal")
         prev_words = ("previous part", "prev part", "previous image", "show previous", "go back")
         hide_words = ("hide exploded", "close exploded", "hide internal", "close internal", "hide parts")
+        next_page_words = ("next page", "next layer", "page forward", "go next page")
+        prev_page_words = ("previous page", "prev page", "back page", "go previous page", "last page")
+        save_words = ("save circuit", "save project", "save board")
+        undo_words = ("undo", "undo that", "go undo")
+        circuit_on_words = ("enable circuit mode", "turn on circuit mode", "start circuit mode")
+        circuit_off_words = ("disable circuit mode", "turn off circuit mode", "stop circuit mode")
+        circuit_toggle_words = ("toggle circuit mode",)
+        draw_on_words = ("enable wire draw mode", "turn on wire draw mode", "enable draw mode", "turn on draw mode")
+        draw_off_words = ("disable wire draw mode", "turn off wire draw mode", "disable draw mode", "turn off draw mode")
+        draw_toggle_words = ("toggle wire draw mode", "toggle draw mode")
+        sim_on_words = ("start simulation", "run simulation", "enable simulation")
+        sim_off_words = ("stop simulation", "disable simulation", "end simulation")
+        sim_toggle_words = ("toggle simulation",)
+        projector_on_words = ("project to screen", "turn on projector", "open projector", "start projector", "enable projector")
+        projector_off_words = ("turn off projector", "close projector", "disable projector", "stop projector")
+        projector_toggle_words = ("toggle projector",)
+        calib_on_words = ("show calibration grid", "open calibration grid", "enable calibration grid", "turn on calibration")
+        calib_off_words = ("hide calibration grid", "close calibration grid", "disable calibration grid", "turn off calibration")
+        calib_toggle_words = ("toggle calibration grid", "toggle calibration")
         show_words = (
             "show exploded",
             "exploded view",
@@ -883,6 +933,99 @@ class AIILAKernel:
             "show me inside",
         )
 
+        if any(word in cmd for word in settings_words):
+            self.request_ui_command('open_settings')
+            self._feedback("OPENING SETTINGS")
+            return True
+
+        if any(word in cmd for word in scan_words):
+            self.pending_scan = True
+            self._feedback("SCAN REQUESTED")
+            return True
+
+        if any(word in cmd for word in save_words):
+            self.save_circuit("circuit.json")
+            return True
+
+        if any(word in cmd for word in undo_words):
+            self.undo()
+            return True
+
+        if any(word in cmd for word in circuit_on_words):
+            self.request_ui_command('circuit_on')
+            self._feedback("CIRCUIT MODE ON")
+            return True
+
+        if any(word in cmd for word in circuit_off_words):
+            self.request_ui_command('circuit_off')
+            self._feedback("CIRCUIT MODE OFF")
+            return True
+
+        if any(word in cmd for word in circuit_toggle_words):
+            self.request_ui_command('toggle_circuit')
+            self._feedback("TOGGLING CIRCUIT MODE")
+            return True
+
+        if any(word in cmd for word in draw_on_words):
+            self.request_ui_command('draw_on')
+            self._feedback("WIRE DRAW MODE ON")
+            return True
+
+        if any(word in cmd for word in draw_off_words):
+            self.request_ui_command('draw_off')
+            self._feedback("WIRE DRAW MODE OFF")
+            return True
+
+        if any(word in cmd for word in draw_toggle_words):
+            self.request_ui_command('toggle_draw')
+            self._feedback("TOGGLING WIRE DRAW MODE")
+            return True
+
+        if any(word in cmd for word in sim_on_words):
+            self.request_ui_command('simulation_on')
+            self._feedback("SIMULATION START")
+            return True
+
+        if any(word in cmd for word in sim_off_words):
+            self.request_ui_command('simulation_off')
+            self._feedback("SIMULATION STOP")
+            return True
+
+        if any(word in cmd for word in sim_toggle_words):
+            self.request_ui_command('toggle_simulation')
+            self._feedback("TOGGLING SIMULATION")
+            return True
+
+        if any(word in cmd for word in projector_on_words):
+            self.request_ui_command('projector_on')
+            self._feedback("PROJECTOR ON")
+            return True
+
+        if any(word in cmd for word in projector_off_words):
+            self.request_ui_command('projector_off')
+            self._feedback("PROJECTOR OFF")
+            return True
+
+        if any(word in cmd for word in projector_toggle_words):
+            self.request_ui_command('toggle_projector')
+            self._feedback("TOGGLING PROJECTOR")
+            return True
+
+        if any(word in cmd for word in calib_on_words):
+            self.request_ui_command('calibration_on')
+            self._feedback("CALIBRATION ON")
+            return True
+
+        if any(word in cmd for word in calib_off_words):
+            self.request_ui_command('calibration_off')
+            self._feedback("CALIBRATION OFF")
+            return True
+
+        if any(word in cmd for word in calib_toggle_words):
+            self.request_ui_command('toggle_calibration')
+            self._feedback("TOGGLING CALIBRATION")
+            return True
+
         if any(word in cmd for word in next_words):
             if not self.next_exploded_view():
                 self._feedback("⚠ No next internal image")
@@ -891,6 +1034,27 @@ class AIILAKernel:
         if any(word in cmd for word in prev_words):
             if not self.previous_exploded_view():
                 self._feedback("⚠ No previous internal image")
+            return True
+
+        if any(word in cmd for word in next_page_words):
+            self.shift_page(1)
+            return True
+
+        if any(word in cmd for word in prev_page_words):
+            self.shift_page(-1)
+            return True
+
+        page_match = re.search(r"\b(?:page|layer)\s+(\d+)\b", cmd)
+        if page_match:
+            self.set_page(int(page_match.group(1)))
+            return True
+
+        if "first page" in cmd or "first layer" in cmd:
+            self.set_page(1)
+            return True
+
+        if "second page" in cmd or "second layer" in cmd:
+            self.set_page(2)
             return True
 
         if any(word in cmd for word in hide_words):
@@ -939,10 +1103,12 @@ class AIILAKernel:
 
     def start_simulation(self):
         self.circuit_engine.start_simulation()
+        self.app_state['simulation_running'] = True
         self._feedback("▶ SIM START")
 
     def stop_simulation(self):
         self.circuit_engine.stop_simulation()
+        self.app_state['simulation_running'] = False
         self._feedback("■ SIM STOP")
 
     def save_circuit(self, path: str = "circuit.json"):

@@ -191,16 +191,17 @@ class CamPreview(QLabel):
 
     def paintEvent(self, event):
         super().paintEvent(event)
-        if self._pixmap:
-            self.setPixmap(
-                self._pixmap.scaled(
-                    self.size(),
-                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                    Qt.TransformationMode.FastTransformation,
-                )
-            )
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self._pixmap:
+            scaled = self._pixmap.scaled(
+                self.size(),
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.FastTransformation,
+            )
+            x = (self.width() - scaled.width()) // 2
+            y = (self.height() - scaled.height()) // 2
+            p.drawPixmap(x, y, scaled)
         pen = QPen(QColor(C['accent']), 2)
         p.setPen(pen)
         L, T, R, B, S = 6, 6, self.width()-6, self.height()-6, 18
@@ -693,6 +694,7 @@ class Viewport(QLabel):
         self.setStyleSheet(f"background: {C['bg']}; border: none;")
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
                            QSizePolicy.Policy.Expanding)
+        self._pixmap = None
         self._scan_y = 0
         self._sim_on = False
         self._t0     = time.time()
@@ -701,10 +703,7 @@ class Viewport(QLabel):
         self._sim_on = on
 
     def set_frame(self, px: QPixmap):
-        self.setPixmap(
-            px.scaled(self.size(),
-                      Qt.AspectRatioMode.KeepAspectRatio,
-                      Qt.TransformationMode.FastTransformation))
+        self._pixmap = px
         self._scan_y = (self._scan_y + 3) % max(self.height(), 1)
         self.update()
 
@@ -713,6 +712,15 @@ class Viewport(QLabel):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         W, H = self.width(), self.height()
+        if self._pixmap:
+            scaled = self._pixmap.scaled(
+                self.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            )
+            x = (W - scaled.width()) // 2
+            y = (H - scaled.height()) // 2
+            p.drawPixmap(x, y, scaled)
         S    = 22
         col  = QColor(C['accent'])
         col.setAlpha(200)

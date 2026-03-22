@@ -193,8 +193,59 @@ class UIHub(QMainWindow):
         self._bind_shortcut('run_simulation', keybinds['run_simulation'], self._toggle_sim)
         self._bind_shortcut('project_to_screen', keybinds['project_to_screen'], self._toggle_projector)
 
+    def _consume_ui_command_request(self):
+        command = self.kernel.app_state.get('ui_command_request')
+        if not command:
+            return
+
+        self.kernel.app_state['ui_command_request'] = None
+
+        if command == 'open_settings':
+            self._open_settings()
+        elif command == 'toggle_circuit':
+            self._toggle_circuit()
+        elif command == 'circuit_on':
+            if not self._circuit_active:
+                self._toggle_circuit()
+        elif command == 'circuit_off':
+            if self._circuit_active:
+                self._toggle_circuit()
+        elif command == 'toggle_draw':
+            self._toggle_draw_mode()
+        elif command == 'draw_on':
+            if self.kernel.app_state.get('ar_mode') != 'draw':
+                self._toggle_draw_mode()
+        elif command == 'draw_off':
+            if self.kernel.app_state.get('ar_mode') == 'draw':
+                self._toggle_draw_mode()
+        elif command == 'toggle_simulation':
+            self._toggle_sim()
+        elif command == 'simulation_on':
+            if not self._sim_active:
+                self._toggle_sim()
+        elif command == 'simulation_off':
+            if self._sim_active:
+                self._toggle_sim()
+        elif command == 'toggle_projector':
+            self._toggle_projector()
+        elif command == 'projector_on':
+            if self.projector_window is None:
+                self._toggle_projector()
+        elif command == 'projector_off':
+            if self.projector_window is not None:
+                self._toggle_projector()
+        elif command == 'toggle_calibration':
+            self._toggle_calib()
+        elif command == 'calibration_on':
+            if not self.calibration_mode:
+                self._toggle_calib()
+        elif command == 'calibration_off':
+            if self.calibration_mode:
+                self._toggle_calib()
+
     def _loop(self):
         self._clock.setText(time.strftime("  %Y-%m-%d   %H:%M:%S  "))
+        self._consume_ui_command_request()
 
         now = time.monotonic()
         self._fps_times.append(now)
@@ -297,16 +348,19 @@ class UIHub(QMainWindow):
             proj = monitors[1]
             self.projector_window = ProjectorWindow(proj.x, proj.y)
             self.projector_window.show()
+            self.kernel.app_state['projector_enabled'] = True
             self.sidebar.btn_project.set_active(True)
             self.sidebar.terminal.push(f"Projector on display {proj.name}", "SYS")
         else:
             self.projector_window.close()
             self.projector_window = None
+            self.kernel.app_state['projector_enabled'] = False
             self.sidebar.btn_project.set_active(False)
             self.sidebar.terminal.push("Projector closed", "SYS")
 
     def _toggle_calib(self):
         self.calibration_mode = not self.calibration_mode
+        self.kernel.app_state['calibration_mode'] = self.calibration_mode
         self.sidebar.btn_calib.set_active(self.calibration_mode)
         self.sidebar.terminal.push(
             f"Calibration grid {'ON' if self.calibration_mode else 'OFF'}", "SYS")
@@ -321,6 +375,10 @@ class UIHub(QMainWindow):
         self.sidebar.terminal.push("Undo performed", "SYS")
 
     def _open_settings(self):
+        if hasattr(self, '_settings_dlg') and self._settings_dlg.isVisible():
+            self._settings_dlg.raise_()
+            self._settings_dlg.activateWindow()
+            return
         self.sidebar.terminal.push("Opening hardware settings…", "SYS")
         self._settings_dlg = SettingsPanel(self, self.kernel.app_state, self.kernel)
         self._settings_dlg.show()
@@ -343,6 +401,7 @@ class UIHub(QMainWindow):
             except Exception:
                 pass
             self.projector_window = None
+            self.kernel.app_state['projector_enabled'] = False
 
         try:
             if self._worker.is_alive():

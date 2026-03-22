@@ -6,12 +6,15 @@ mediapipe
 sounddevice
 soundfile
 SpeechRecognition
+vosk
 pyttsx3
 requests
 pydub
 #simpleaudio
 openai
 elevenlabs
+google-genai
+python-dotenv
 
 # --- NEW UI DEPENDENCIES ---
 customtkinter      # Modern UI framework
